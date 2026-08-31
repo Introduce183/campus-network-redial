@@ -1,5 +1,7 @@
 # 校园网出口检测 + 自动重拨
 
+[<span style="color:#e0a587;">给我点个star喵</span>](https://github.com/Introduce183/campus-network-redial)
+
 拨号上网时，每次拨号可能分配到不同的出口。好出口一切正常；坏出口会对部分服务限速，导致某些应用加载不出来。
 
 本工具通过探针判断当前出口好坏，并在出口不好时自动重拨，直到拿到好出口。
