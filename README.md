@@ -1,6 +1,6 @@
 # 校园网出口检测 + 自动重拨
 
-[<span style="color:#e0a587;">给我点个star喵</span>](https://github.com/Introduce183/campus-network-redial)
+[![给我点个star喵](https://img.shields.io/badge/%E7%BB%99%E6%88%91%E7%82%B9%E4%B8%AAstar%E5%96%B5-e0a587?style=for-the-badge)](https://github.com/Introduce183/campus-network-redial)
 
 拨号上网时，每次拨号可能分配到不同的出口。好出口一切正常；坏出口会对部分服务限速，导致某些应用加载不出来。
 
