@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
 Redials a Windows dial-up connection until the current exit is a good exit.
 
@@ -98,6 +98,8 @@ for ($attempt = 1; ($MaxAttempts -eq 0) -or ($attempt -le $MaxAttempts); $attemp
     Start-Sleep -Seconds $SettleSeconds
     if (Test-CampusExit) {
         Write-Host 'Good campus-network exit found and confirmed.' -ForegroundColor Green
+        Write-Host '好了喵' -ForegroundColor Green
+        Write-Host '-- introduce'
         exit 0
     }
 

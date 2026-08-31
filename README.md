@@ -23,6 +23,10 @@ powershell -ExecutionPolicy Bypass -File .\Test-CampusExit.ps1
 
 ### 自动重拨直到好出口
 
+最简单的方式：直接双击 `Redial-UntilCampusReady.bat`。它会先自动检测拨号上网电话簿里的宽带名称，再用检测到的名称运行主脚本。
+
+也可以手动在 PowerShell 里运行：
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1
 ```
@@ -39,7 +43,7 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName
 
 - 每轮探测多次，全部通过才算一轮通过。
 - 两轮探测（间隔确认）都通过，才判定为“好出口”。
-- 判定为好出口后脚本停止，此时网络可正常使用。
+- 判定为好出口后脚本停止，并提示“好了喵”（署名 introduce），此时网络可正常使用。
 
 ## 参数
 
