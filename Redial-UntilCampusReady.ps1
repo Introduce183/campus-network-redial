@@ -6,7 +6,8 @@ Redials a Windows dial-up connection until the current exit is a good exit.
 Each dial-up session is assigned a different egress. Good exits are unthrottled;
 bad exits throttle a canary service's API hosts. The throttle can take a few
 seconds to apply after a fresh dial, so this waits before judging and confirms
-the probe twice before trusting the exit.
+the probe three times (with a longer wait before the third check) before
+trusting the exit.
 
 The dial-up connection must already exist in Windows and have its credentials
 saved. If -DialName is omitted, the connection name is detected automatically
@@ -21,6 +22,7 @@ param(
     [ValidateRange(1, 10)] [int]$ProbeCount = 3,
     [ValidateRange(0, 300)] [int]$SettleSeconds = 10,
     [ValidateRange(0, 300)] [int]$ConfirmIntervalSeconds = 12,
+    [ValidateRange(0, 600)] [int]$ThirdIntervalSeconds = 30,
     [ValidateRange(1, 600)] [int]$PauseSeconds = 8,
     [ValidateRange(0, 10000)] [int]$MaxAttempts = 0
 )
@@ -29,10 +31,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Test-CampusExit {
-    foreach ($round in 1..2) {
+    foreach ($round in 1..3) {
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'Test-CampusExit.ps1') -TimeoutSeconds $TimeoutSeconds -Count $ProbeCount | Out-Host
         if ($LASTEXITCODE -ne 0) { return $false }
-        if ($round -lt 2) { Start-Sleep -Seconds $ConfirmIntervalSeconds }
+        if ($round -eq 1) { Start-Sleep -Seconds $ConfirmIntervalSeconds }
+        elseif ($round -eq 2) { Start-Sleep -Seconds $ThirdIntervalSeconds }
     }
     return $true
 }

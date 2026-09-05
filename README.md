@@ -44,7 +44,7 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName
 ## 判定逻辑
 
 - 每轮探测多次，全部通过才算一轮通过。
-- 两轮探测（间隔确认）都通过，才判定为“好出口”。
+- 三轮探测（两段间隔确认）都通过，才判定为“好出口”；第三轮之前等待更久，避免前两轮通过后出口仍不稳定。
 - 判定为好出口后脚本停止，并提示“好了喵”（署名 introduce），此时网络可正常使用。
 
 ## 参数
@@ -56,6 +56,7 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName
 | `-TimeoutSeconds` | 4 | 每次探测超时秒数 |
 | `-ProbeCount` | 3 | 每轮探测次数 |
 | `-SettleSeconds` | 10 | 拨号后等待多少秒再探测 |
-| `-ConfirmIntervalSeconds` | 12 | 两轮确认之间的间隔秒数 |
+| `-ConfirmIntervalSeconds` | 12 | 第 1、2 轮确认之间的间隔秒数 |
+| `-ThirdIntervalSeconds` | 30 | 第 2、3 轮确认之间的间隔秒数 |
 | `-PauseSeconds` | 8 | 重拨之间的等待秒数 |
 | `-MaxAttempts` | 0 | 最大重拨次数，0 表示一直重拨直到成功 |
