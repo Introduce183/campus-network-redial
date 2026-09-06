@@ -74,6 +74,33 @@ function Connect-Dialup {
     return ($LASTEXITCODE -eq 0)
 }
 
+function Get-GoodExit {
+    for ($attempt = 1; ($MaxAttempts -eq 0) -or ($attempt -le $MaxAttempts); $attempt++) {
+        Write-Host "`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Attempt $attempt" -ForegroundColor Cyan
+        Disconnect-Dialup
+        Start-Sleep -Seconds 2
+
+        if (-not (Connect-Dialup)) {
+            Write-Warning "Dial-up failed. Retrying in $PauseSeconds seconds."
+            Start-Sleep -Seconds $PauseSeconds
+            continue
+        }
+
+        Write-Host "Waiting $SettleSeconds seconds for the new exit to settle before probing..."
+        Start-Sleep -Seconds $SettleSeconds
+        if (Test-CampusExit) {
+            Write-Host 'Good campus-network exit found and confirmed.' -ForegroundColor Green
+            Write-Host '好了喵' -ForegroundColor Green
+            Write-Host '-- introduce'
+            return $true
+        }
+
+        Write-Warning "This exit is throttled; redialling in $PauseSeconds seconds."
+        Start-Sleep -Seconds $PauseSeconds
+    }
+    return $false
+}
+
 if ($TestOnly) {
     if (Test-CampusExit) {
         Write-Host 'Current exit is a good campus-network exit.' -ForegroundColor Green
@@ -86,29 +113,25 @@ if ($TestOnly) {
 $DialName = Resolve-DialName -DialName $DialName
 Write-Host "Using dial-up connection: $DialName"
 
-for ($attempt = 1; ($MaxAttempts -eq 0) -or ($attempt -le $MaxAttempts); $attempt++) {
-    Write-Host "`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Attempt $attempt" -ForegroundColor Cyan
-    Disconnect-Dialup
-    Start-Sleep -Seconds 2
+if (-not (Get-GoodExit)) {
+    Write-Error "No good exit was found after $MaxAttempts attempts."
+    exit 1
+}
 
-    if (-not (Connect-Dialup)) {
-        Write-Warning "Dial-up failed. Retrying in $PauseSeconds seconds."
-        Start-Sleep -Seconds $PauseSeconds
-        continue
-    }
-
-    Write-Host "Waiting $SettleSeconds seconds for the new exit to settle before probing..."
-    Start-Sleep -Seconds $SettleSeconds
-    if (Test-CampusExit) {
-        Write-Host 'Good campus-network exit found and confirmed.' -ForegroundColor Green
-        Write-Host '好了喵' -ForegroundColor Green
-        Write-Host '-- introduce'
+while ($true) {
+    $choice = Read-Host "是否继续测速或者重新拨号？输入 Y 继续，其它任意键退出"
+    if ($choice -notmatch '^[Yy]$') {
         exit 0
     }
 
-    Write-Warning "This exit is throttled; redialling in $PauseSeconds seconds."
-    Start-Sleep -Seconds $PauseSeconds
+    if (Test-CampusExit) {
+        Write-Host '测速通过：当前仍为好出口。' -ForegroundColor Green
+    }
+    else {
+        Write-Warning '测速失败：当前出口已被限速，正在重新拨号...'
+        if (-not (Get-GoodExit)) {
+            Write-Error "No good exit was found after $MaxAttempts attempts."
+            exit 1
+        }
+    }
 }
-
-Write-Error "No good exit was found after $MaxAttempts attempts."
-exit 1
