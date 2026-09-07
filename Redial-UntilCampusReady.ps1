@@ -58,7 +58,7 @@ function Get-DialupName {
 function Resolve-DialName {
     param([string]$DialName)
     if (-not [string]::IsNullOrWhiteSpace($DialName)) { return $DialName }
-    $names = Get-DialupName
+    $names = @(Get-DialupName)
     if ($names.Count -eq 1) { return $names[0] }
     if ($names.Count -gt 1) {
         $active = & rasdial.exe 2>$null | Out-String
