@@ -41,6 +41,10 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName
 
 按 `Ctrl+C` 可随时停止。
 
+### 设置开机自启
+
+双击 `Set-AutoStart.bat`，按菜单选择开启或关闭开机自启。开启后，每次登录 Windows 都会自动运行拨号脚本，直到拿到好出口。
+
 ## 判定逻辑
 
 - 每轮探测多次，全部通过才算一轮通过。
