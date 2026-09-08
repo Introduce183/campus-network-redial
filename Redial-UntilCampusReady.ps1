@@ -13,15 +13,15 @@ The dial-up connection must already exist in Windows and have its credentials
 saved. If -DialName is omitted, the connection name is detected automatically
 (falls back to "宽带连接").
 
-Use -200MbpsMode to keep redialling until the Xidian LibreSpeed download test
-exceeds 150 Mbps.
+Use -HighBandwidthMode to keep redialling until the Xidian LibreSpeed download
+test exceeds 150 Mbps.
 #>
 
 [CmdletBinding()]
 param(
     [string]$DialName,
     [switch]$TestOnly,
-    [switch]$200MbpsMode,
+    [switch]$HighBandwidthMode,
     [ValidateRange(1, 60)] [int]$TimeoutSeconds = 4,
     [ValidateRange(1, 10)] [int]$ProbeCount = 3,
     [ValidateRange(0, 300)] [int]$SettleSeconds = 3,
@@ -34,6 +34,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
+
+$TargetMbps = 150
 
 function Test-CampusExit {
     foreach ($round in 1..3) {
@@ -137,17 +139,21 @@ function Measure-XidianBandwidth {
     }
 }
 
+function Test-HighBandwidth {
+    $result = Measure-XidianBandwidth
+    Write-Host ("测速结果：{0:N2} Mbps，耗时 {1:N2} 秒（{2}）。" -f $result.Mbps, $result.Seconds, $result.Note)
+    if ($result.Succeeded -and $result.Mbps -gt $TargetMbps) {
+        Write-Host "已达到 $TargetMbps Mbps 目标，停止重拨。" -ForegroundColor Green
+        return $true
+    }
+    return $false
+}
+
 function Get-HighBandwidthExit {
-     $result = Measure-XidianBandwidth
-        Write-Host ("测速结果：{0:N2} Mbps，耗时 {1:N2} 秒（{2}）。" -f $result.Mbps, $result.Seconds, $result.Note)
-        if ($result.Succeeded -and $result.Mbps -gt 150) {
-            Write-Host '已达到 150 Mbps 目标，停止重拨。' -ForegroundColor Green
-            return $true
-        }
-    $attempt = 0
-    while ($true) {
-        $attempt++
-        Write-Host "`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] 200Mbps 模式：第 $attempt 次连接尝试" -ForegroundColor Cyan
+    if (Test-HighBandwidth) { return $true }
+
+    for ($attempt = 1; ; $attempt++) {
+        Write-Host "`n[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] 高速模式：第 $attempt 次连接尝试" -ForegroundColor Cyan
         Disconnect-Dialup
         Start-Sleep -Seconds 2
 
@@ -157,16 +163,11 @@ function Get-HighBandwidthExit {
             continue
         }
 
-        Write-Host "等待 $SettleSeconds 秒后开始测速（目标 > 150 Mbps）..."
+        Write-Host "等待 $SettleSeconds 秒后开始测速（目标 > $TargetMbps Mbps）..."
         Start-Sleep -Seconds $SettleSeconds
-        $result = Measure-XidianBandwidth
-        Write-Host ("测速结果：{0:N2} Mbps，耗时 {1:N2} 秒（{2}）。" -f $result.Mbps, $result.Seconds, $result.Note)
-        if ($result.Succeeded -and $result.Mbps -gt 150) {
-            Write-Host '已达到 150 Mbps 目标，停止重拨。' -ForegroundColor Green
-            return $true
-        }
+        if (Test-HighBandwidth) { return $true }
 
-        Write-Warning '带宽未超过 150 Mbps，将重新拨号。'
+        Write-Warning "带宽未超过 $TargetMbps Mbps，将重新拨号。"
         Start-Sleep -Seconds $PauseSeconds
     }
 }
@@ -198,8 +199,8 @@ function Get-GoodExit {
     return $false
 }
 
-if ($TestOnly -and ${200MbpsMode}) {
-    throw '-200MbpsMode 不能与 -TestOnly 同时使用。'
+if ($TestOnly -and $HighBandwidthMode) {
+    throw '-HighBandwidthMode 不能与 -TestOnly 同时使用。'
 }
 
 if ($TestOnly) {
@@ -214,7 +215,7 @@ if ($TestOnly) {
 $DialName = Resolve-DialName -DialName $DialName
 Write-Host "Using dial-up connection: $DialName"
 
-if (${200MbpsMode}) {
+if ($HighBandwidthMode) {
     [void](Get-HighBandwidthExit)
     exit 0
 }

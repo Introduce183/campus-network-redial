@@ -41,6 +41,16 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName
 
 按 `Ctrl+C` 可随时停止。
 
+### 高速模式：重拨直到带宽达标
+
+如果只关心出口带宽，可以用 `-HighBandwidthMode`：脚本会重拨并测速，直到西电 LibreSpeed 下载测速超过 150 Mbps 才停下。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -HighBandwidthMode
+```
+
+该模式与 `-TestOnly` 互斥，不能同时使用。
+
 ### 设置开机自启
 
 双击 `Set-AutoStart.bat`，按菜单选择开启或关闭开机自启。开启后，每次登录 Windows 都会自动运行拨号脚本，直到拿到好出口。
@@ -57,10 +67,11 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName
 | --- | --- | --- |
 | `-DialName` | 自动识别 | 拨号连接名（`rasdial` 可查看）|
 | `-TestOnly` | 关 | 只测当前网络，不拨号 |
+| `-HighBandwidthMode` | 关 | 高速模式：重拨直到测速超过 150 Mbps（不能与 `-TestOnly` 同时使用）|
 | `-TimeoutSeconds` | 4 | 每次探测超时秒数 |
 | `-ProbeCount` | 3 | 每轮探测次数 |
-| `-SettleSeconds` | 10 | 拨号后等待多少秒再探测 |
+| `-SettleSeconds` | 3 | 拨号后等待多少秒再探测 |
 | `-ConfirmIntervalSeconds` | 12 | 第 1、2 轮确认之间的间隔秒数 |
 | `-ThirdIntervalSeconds` | 30 | 第 2、3 轮确认之间的间隔秒数 |
-| `-PauseSeconds` | 8 | 重拨之间的等待秒数 |
+| `-PauseSeconds` | 2 | 重拨之间的等待秒数 |
 | `-MaxAttempts` | 0 | 最大重拨次数，0 表示一直重拨直到成功 |
