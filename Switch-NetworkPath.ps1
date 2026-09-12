@@ -37,8 +37,9 @@ param(
     [ValidateRange(0, 300)] [int]$SettleSeconds = 3,
     [ValidateRange(0, 300)] [int]$ConfirmIntervalSeconds = 12,
     [ValidateRange(0, 600)] [int]$ThirdIntervalSeconds = 30,
-    [ValidateRange(5, 3600)] [int]$HealthIntervalSeconds = 5,
-    [ValidateRange(1, 100)] [int]$FailThreshold = 2,
+    [ValidateRange(1, 3600)] [int]$HealthIntervalSeconds = 3,
+    [ValidateRange(1, 10)] [int]$HealthPassThreshold = 2,
+    [ValidateRange(1, 100)] [int]$FailThreshold = 1,
     [ValidateRange(1, 600)] [int]$PauseSeconds = 2,
     [ValidateRange(1, 3600)] [int]$MaxDialBackoffSeconds = 60,
     [string]$LogPath,
@@ -57,6 +58,8 @@ $script:CanaryUris = @()
 $script:PbkBackup = $null
 $script:LastProbeSummary = ''
 $script:LastProbeMode = ''
+$script:LastProbePassed = -1
+$script:LastProbeTotal = -1
 
 # 在脚本作用域就把这两样取好，供 Restart-Elevated 使用（原因见该函数内的注释）。
 $script:ManagerPath = $PSCommandPath
@@ -339,19 +342,20 @@ function Enter-Parked {
     $dialIf = Get-DialInterface
     if (-not $dialIf) { return $true }
 
+    # 删掉这条默认路由**本身就是切换动作** —— 流量立刻就回到 Wi-Fi，不用等下面那段确认。
     if (Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $dialIf.ifIndex -ErrorAction SilentlyContinue) {
         Remove-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $dialIf.ifIndex -Confirm:$false -ErrorAction SilentlyContinue
     }
 
-    foreach ($i in 1..4) {
+    # 下面只是确认，不是切换本身，所以间隔压短（250ms × 8 ≈ 最多 2 秒）。
+    foreach ($i in 1..8) {
         if (-not (Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -InterfaceIndex $dialIf.ifIndex -ErrorAction SilentlyContinue)) {
             $path = Get-CurrentPath
             if ($path -eq 'wifi' -or $path -eq 'unknown') { return $true }
-            Write-Log ("停放后承载仍为 {0}，继续等待。" -f $path) 'WARN'
         }
-        Start-Sleep -Milliseconds 800
+        Start-Sleep -Milliseconds 250
     }
-    Write-Log '无法把拨号停放（默认路由删不掉），为安全起见不晋升。' 'ERROR'
+    Write-Log '无法把拨号停放（默认路由删不掉或承载没回到 Wi-Fi），为安全起见不晋升。' 'ERROR'
     return $false
 }
 
@@ -472,11 +476,26 @@ function Get-RatifiedProbeResult {
     $passed = ($LASTEXITCODE -eq 0)
     $summary = @($output -split "`r?`n" | Where-Object { $_ -match 'probe passed' } | Select-Object -Last 1)
     if ($summary.Count -gt 0) { $summary = $summary[0].Trim() } else { $summary = '（探针没有输出结果行）' }
-    return [pscustomobject]@{ Passed = $passed; Summary = $summary }
+
+    # 从探针输出里把"通过几个 / 共几个"抠出来（探针脚本本身零修改，只读它的输出）。
+    # 健康检查要用"多数即算健康"的判据，光有退出码不够。
+    $passedCount = -1
+    $totalCount = -1
+    $m = [regex]::Match($summary, 'probe passed (\d+) of (\d+)')
+    if ($m.Success) {
+        $passedCount = [int]$m.Groups[1].Value
+        $totalCount = [int]$m.Groups[2].Value
+    }
+    return [pscustomobject]@{ Passed = $passed; Summary = $summary; PassedCount = $passedCount; TotalCount = $totalCount }
 }
 
 function Test-DialExitPath {
-    param([string]$Label, [switch]$CheckEgress, [switch]$Quiet)
+    # PassThreshold：需要几个探针通过才算这一轮通过。
+    #   传 0（默认）＝ 全部通过，这是**晋升判定**用的严格判据，别动。
+    #   健康检查传多数阈值（见 -HealthPassThreshold），因为单次偶发超时不该直接判死。
+    param([string]$Label, [switch]$CheckEgress, [switch]$Quiet, [int]$PassThreshold = 0)
+
+    if ($PassThreshold -le 0) { $PassThreshold = $ProbeCount }
 
     $dialIf = Get-DialInterface
     if (-not $dialIf) { Write-Log '拨号未连接，无法探测。' 'WARN'; return $false }
@@ -484,7 +503,7 @@ function Test-DialExitPath {
     # 是否需要用 /32 把 canary 引导到拨号。
     #
     # 主用态（拨号自己握着最优默认路由）时**不需要**引导：canary 天然走拨号。
-    # 省掉这一段能砍掉每轮 18 次路由表操作 —— 健康检查设成 5 秒一次就必须省，
+    # 省掉这一段能砍掉每轮 18 次路由表操作 —— 健康检查设成几秒一次就必须省，
     # 否则每分钟要做约 170 次路由增删。这时用一个廉价断言代替：
     # 确认最优默认路由确实是拨号（读一次路由表），拿不准就当本轮不通过。
     #
@@ -533,11 +552,18 @@ function Test-DialExitPath {
         # 把结果与模式留在脚本作用域，供 -Quiet 的调用方（健康检查）取用。
         $script:LastProbeSummary = $result.Summary
         $script:LastProbeMode = $mode
+        $script:LastProbePassed = $result.PassedCount
+        $script:LastProbeTotal = $result.TotalCount
+
+        # 通过判定：抠得出计数就按阈值比（健康检查用"多数即健康"），
+        # 抠不出就退回退出码语义（全部通过）。
+        $ok = if ($result.PassedCount -ge 0) { $result.PassedCount -ge $PassThreshold } else { $result.Passed }
+
         if (-not $Quiet) {
-            if ($result.Passed) { Write-Log ("{0}：通过 —— {1}（{2}）" -f $Label, $result.Summary, $mode) }
+            if ($ok) { Write-Log ("{0}：通过 —— {1}（{2}）" -f $Label, $result.Summary, $mode) }
             else { Write-Log ("{0}：未通过 —— {1}（{2}）" -f $Label, $result.Summary, $mode) 'WARN' }
         }
-        if (-not $result.Passed) { return $false }
+        if (-not $ok) { return $false }
 
         if ($CheckEgress) {
             # 行为闸：确认探针确实从拨号出口发出（DNS 解析到没被 /32 覆盖的 IP 也能被抓到）。
@@ -648,7 +674,8 @@ if (-not $wifiAdapter) {
 $wifiLabel = if ($wifiAdapter) { $wifiAdapter.Name } else { '无' }
 Write-Log '==================== 网络管理器启动 ===================='
 Write-Log ("拨号：{0}；Wi-Fi：{1}；当前承载：{2}；canary：{3}" -f $DialName, $wifiLabel, (Get-CurrentPath), ($script:CanaryUris -join ' '))
-Write-Log ("验证：快判 + 确认(间隔 {0}s / {1}s，末轮含出口源地址确认)；健康检查每 {2}s，连续失败 {3} 次降级。" -f $ConfirmIntervalSeconds, $ThirdIntervalSeconds, $HealthIntervalSeconds, $FailThreshold)
+Write-Log ("验证（晋升判据）：快判 + 确认(间隔 {0}s / {1}s，每轮 {2} 个探针须**全部**通过，末轮含出口源地址确认)。" -f $ConfirmIntervalSeconds, $ThirdIntervalSeconds, $ProbeCount)
+Write-Log ("健康检查（已连接后的判据）：每 {0}s 一轮、每轮 {1} 个探针，通过 >= {2} 个即算健康；低于阈值就连续失败 {3} 次后降级切 Wi-Fi（默认为 1，也就是一轮不过就切）。" -f $HealthIntervalSeconds, $ProbeCount, $HealthPassThreshold, $FailThreshold)
 Write-Log ("健康检查路径：主用态直连探测（省掉 /32 引导与出口确认，避免每 {0}s 做一轮路由增删）；停放态用 /32 引导。" -f $HealthIntervalSeconds)
 Write-Log '注意：本脚本只保证一直都有可用网络，可能会在校园网与热点之间切换，不保证游戏时的稳定性。' 'WARN'
 
@@ -752,7 +779,21 @@ try {
                 break
             }
 
-            if (Test-DialExitPath -Label '健康检查' -Quiet) {
+            # 一轮健康检查的判定（用户定的策略）：
+            #   >= HealthPassThreshold 个探针通过（默认 2/3，多数即算健康）→ 健康，继续
+            #   <  阈值                 → 直接降级切 Wi-Fi，不要求"连续失败两次"
+            # 检查本身出错（DNS 挂、CIM 报错等）也按不健康处理 ——
+            # 判不了健康就退回保底，而且不能因为一次异常把整个进程带走。
+            $healthy = $false
+            $checkError = $null
+            try {
+                $healthy = Test-DialExitPath -Label '健康检查' -Quiet -PassThreshold $HealthPassThreshold
+            }
+            catch {
+                $checkError = $_.Exception.Message
+            }
+
+            if ($healthy) {
                 if ($failedBefore) {
                     Write-Log ("健康检查：已恢复 —— {0}（{1}）。本段从 {2} 重新计时。" -f $script:LastProbeSummary, $script:LastProbeMode, (Get-Date -Format 'HH:mm:ss')) 'OK'
                     $failedBefore = $false
@@ -767,17 +808,26 @@ try {
 
             $consecutiveFailures++
             $failedBefore = $true
-            Write-Log ("健康检查：未通过 —— {0}（{1}）。此前已健康 {2}。" -f $script:LastProbeSummary, $script:LastProbeMode, (Format-Duration ((Get-Date) - $healthySince))) 'WARN'
+            $healthyFor = Format-Duration ((Get-Date) - $healthySince)
+            if ($checkError) {
+                Write-Log ("健康检查：出错 —— {0}。按不健康处理，直接切 Wi-Fi。此前已健康 {1}。" -f $checkError, $healthyFor) 'ERROR'
+            }
+            else {
+                Write-Log ("健康检查：未通过 —— 通过 {0}/{1}（阈值 {2}）{3}。此前已健康 {4}。" -f $script:LastProbePassed, $script:LastProbeTotal, $HealthPassThreshold, $script:LastProbeMode, $healthyFor) 'WARN'
+            }
             if ($consecutiveFailures -lt $FailThreshold) { continue }
 
             if (Test-WifiAlive) {
                 # 降级不需要断开：把拨号那条默认路由删掉，流量立刻回到 Wi-Fi，拨号 IP 都不变。
-                Write-Log 'Wi-Fi 保底正常：降级为停放态（不要重连，流量立刻回 Wi-Fi），再后台换出口。' 'WARN'
+                # Enter-Parked 里"删路由"就是切换动作本身，所以日志放在它之后，写的才是真实状态。
                 if (Enter-Parked) {
+                    Write-Log '已降级：流量已回到 Wi-Fi（拨号 IP 不变），现在断开重拨换出口。' 'WARN'
                     Disconnect-Dialup
                     $nextDelay = $PauseSeconds
                 }
                 else {
+                    Write-Log '降级失败（没能切回 Wi-Fi），直接断开重拨。' 'ERROR'
+                    Disconnect-Dialup
                     $nextDelay = 0
                 }
             }
