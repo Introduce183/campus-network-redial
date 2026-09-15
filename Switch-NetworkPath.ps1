@@ -33,12 +33,12 @@ param(
     [string]$DialName,
     [string]$WifiName,
     [ValidateRange(1, 60)] [int]$TimeoutSeconds = 4,
-    [ValidateRange(1, 10)] [int]$ProbeCount = 3,
+    [ValidateRange(1, 10)] [int]$ProbeCount = 2,
     [ValidateRange(0, 300)] [int]$SettleSeconds = 3,
     [ValidateRange(0, 300)] [int]$ConfirmIntervalSeconds = 12,
     [ValidateRange(0, 600)] [int]$ThirdIntervalSeconds = 30,
     [ValidateRange(1, 3600)] [int]$HealthIntervalSeconds = 3,
-    [ValidateRange(1, 10)] [int]$HealthPassThreshold = 2,
+    [ValidateRange(0, 10)] [int]$HealthPassThreshold = 0,
     [ValidateRange(1, 60)] [int]$HealthTimeoutSeconds = 2,
     [ValidateRange(1, 100)] [int]$FailThreshold = 1,
     [ValidateRange(1, 600)] [int]$PauseSeconds = 2,
@@ -477,15 +477,17 @@ function Get-RatifiedProbeResult {
 }
 
 function Invoke-ProbeRound {
-    param([int]$Count, [int]$Timeout)
+    param([int]$Count, [int]$Timeout, [switch]$StopOnFailure)
 
     $probe = Join-Path $PSScriptRoot 'Test-CampusExit.ps1'
-    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe -TimeoutSeconds $Timeout -Count $Count 2>&1 | Out-String
+    $probeArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $probe, '-TimeoutSeconds', $Timeout, '-Count', $Count)
+    if ($StopOnFailure) { $probeArgs += '-StopOnFailure' }
+    $output = & powershell.exe @probeArgs 2>&1 | Out-String
     $passed = ($LASTEXITCODE -eq 0)
     $summary = @($output -split "`r?`n" | Where-Object { $_ -match 'probe passed' } | Select-Object -Last 1)
     if ($summary.Count -gt 0) { $summary = $summary[0].Trim() } else { $summary = '（探针没有输出结果行）' }
 
-    # 从探针输出里把"通过几个 / 共几个"抠出来。健康检查要用"多数即算健康"和"早停"，
+    # 从探针输出里把"通过几个 / 共几个"抠出来。判定要按计数比阈值，光有退出码不够。
     # 光有退出码不够。抠不出来时 PassedCount 保持 -1，调用方退回退出码语义。
     $passedCount = -1
     $totalCount = -1
@@ -498,18 +500,18 @@ function Invoke-ProbeRound {
 }
 
 function Test-HealthRound {
-    # 健康检查专用：主用态下直连探测（拨号自己握着默认路由，canary 天然走拨号），
-    # 并且**一旦这一轮已经不可能达标就立刻停手**，不再等剩下的探针超时。
+    # 健康检查专用：主用态下直连探测（拨号自己握着默认路由，canary 天然走拨号）。
     #
-    # 为什么分两次调用探针：探针是 $uris[(i-1) % 2] 轮转的，所以
-    #   -Count 2  -> abvolcapi, apiv2   （两个主机都覆盖到）
-    #   -Count 1  -> abvolcapi
-    # 合起来和 -Count 3 覆盖的 canary 完全一致，判据也一样 ——
-    # 只是"两个都挂"时能省掉第三个探针的一整个超时。
+    # 判据（用户定的）：**只要有一个探针挂就立刻切 Wi-Fi** ——
+    # 也就是这一轮必须全部通过。HealthPassThreshold 默认 0（表示"全部"），
+    # 想放宽就传正整数（例如 3 个探针时传 2 = 容忍一个挂）。
     #
-    # Timeout 用 HealthTimeoutSeconds（默认 2），比晋升验证用的 4 秒短：
-    # 实测健康出口的单个探针只要 ~0.2 秒，2 秒已是 10 倍余量，
-    # 而坏出口的等待能从 3x4=12 秒压到 2x2=4 秒。
+    # ProbeCount 默认 2，两个 canary 主机各占一票、等权。
+    # （之前是 3 个探针，而轮转 $uris[(i-1) % 2] 会让 abvolcapi 拿到两个位置、
+    #   apiv2 只拿一个，投票权重 2:1 —— 那个重复采样已经删掉了。）
+    #
+    # 超时用 HealthTimeoutSeconds（默认 2s），比晋升验证的 4s 短：
+    # 实测健康出口的单探针 150-460ms，2 秒是 4-13 倍余量。
     $dialIf = Get-DialInterface
     if (-not $dialIf) { Write-Log '拨号未连接，无法探测。' 'WARN'; return $false }
 
@@ -520,48 +522,20 @@ function Test-HealthRound {
         return $false
     }
 
-    $total = $ProbeCount
-    $threshold = [Math]::Min($HealthPassThreshold, $total)
-
-    if ($total -ne 3) {
-        # 只有 3 个探针时上面的 2+1 拆分才和轮转对得上；其它数量就别早停，老实跑完。
-        $r = Invoke-ProbeRound -Count $total -Timeout $HealthTimeoutSeconds
-        $script:LastProbeSummary = $r.Summary
-        $script:LastProbeMode = '直连探测'
-        $script:LastProbePassed = $r.PassedCount
-        $script:LastProbeTotal = $r.TotalCount
-        if ($r.PassedCount -ge 0) { return ($r.PassedCount -ge $threshold) }
-        return $r.Passed
-    }
-
-    $r1 = Invoke-ProbeRound -Count 2 -Timeout $HealthTimeoutSeconds
-    if ($r1.PassedCount -lt 0) {
-        # 抠不出计数就退回退出码语义。这种时候不能保证早停判断正确，老实把第三个也跑完。
-        $r2 = Invoke-ProbeRound -Count 1 -Timeout $HealthTimeoutSeconds
-        $script:LastProbeSummary = $r2.Summary
-        $script:LastProbeMode = '直连探测'
-        $script:LastProbePassed = -1
-        $script:LastProbeTotal = $total
-        return ($r1.Passed -and $r2.Passed)
-    }
-
-    $passed = $r1.PassedCount
-    # 还剩 1 个探针没跑。把它的最好情况也算上仍达不到阈值，就是已经判死了 → 早停。
-    if (($passed + 1) -lt $threshold) {
-        $script:LastProbeSummary = ('Campus exit probe passed {0} of 2（早停，未跑第 3 个）' -f $passed)
-        $script:LastProbeMode = '直连探测'
-        $script:LastProbePassed = $passed
-        $script:LastProbeTotal = $total
-        return $false
-    }
-
-    $r3 = Invoke-ProbeRound -Count 1 -Timeout $HealthTimeoutSeconds
-    $passed += $r3.PassedCount
-    $script:LastProbeSummary = ('Campus exit probe passed {0} of {1}（2+1 分段探测）' -f $passed, $total)
+    # 判据是"必须全部通过"，所以第一个探针一挂这一轮就已经输了 ——
+    # 让探针脚本 StopOnFailure 提前收手，不用再等剩下的超时。
+    $r = Invoke-ProbeRound -Count $ProbeCount -Timeout $HealthTimeoutSeconds -StopOnFailure
+    $script:LastProbeSummary = $r.Summary
     $script:LastProbeMode = '直连探测'
-    $script:LastProbePassed = $passed
-    $script:LastProbeTotal = $total
-    return ($passed -ge $threshold)
+    $script:LastProbePassed = $r.PassedCount
+    $script:LastProbeTotal = $r.TotalCount
+
+    # 抠得出计数就按阈值比（0 = 全部通过），抠不出就退回退出码语义。
+    if ($r.PassedCount -ge 0) {
+        $threshold = if ($HealthPassThreshold -le 0) { $ProbeCount } else { [Math]::Min($HealthPassThreshold, $ProbeCount) }
+        return ($r.PassedCount -ge $threshold)
+    }
+    return $r.Passed
 }
 
 function Test-DialExitPath {
@@ -571,7 +545,7 @@ function Test-DialExitPath {
     # /32 主机路由指向拨号接口，测的才是拨号出口。
     #
     # 判据用最严格的一档：这一轮 ProbeCount 个探针必须**全部**通过 —— 这是晋升基准，别动。
-    # 健康检查不在这个函数里，见 Test-HealthRound（它跑在主用态、不需要引导、而且会早停）。
+    # 健康检查不在这个函数里，见 Test-HealthRound（它跑在主用态、不需要引导）。
     param([string]$Label, [switch]$CheckEgress)
 
     $dialIf = Get-DialInterface
@@ -719,8 +693,13 @@ if (-not $wifiAdapter) {
 $wifiLabel = if ($wifiAdapter) { $wifiAdapter.Name } else { '无' }
 Write-Log '==================== 网络管理器启动 ===================='
 Write-Log ("拨号：{0}；Wi-Fi：{1}；当前承载：{2}；canary：{3}" -f $DialName, $wifiLabel, (Get-CurrentPath), ($script:CanaryUris -join ' '))
-Write-Log ("验证（晋升判据）：快判 + 确认(间隔 {0}s / {1}s，每轮 {2} 个探针须**全部**通过，末轮含出口源地址确认)。" -f $ConfirmIntervalSeconds, $ThirdIntervalSeconds, $ProbeCount)
-Write-Log ("健康检查（已连接后的判据）：每 {0}s 一轮、每轮 {1} 个探针（分段跑，一旦凑不到 {2} 个通过就立刻停手）、探针超时 {3}s；通过 >= {2} 个即算健康，低于阈值就连续失败 {4} 次后降级切 Wi-Fi。" -f $HealthIntervalSeconds, $ProbeCount, $HealthPassThreshold, $HealthTimeoutSeconds, $FailThreshold)
+# 把"一轮到底怎么判"算成一句话打进日志，避免语义只存在于代码里。
+$healthRule = '只要有一个探针挂就算不健康（须全部通过）'
+if ($HealthPassThreshold -gt 0 -and $HealthPassThreshold -lt $ProbeCount) {
+    $healthRule = ('通过 >= {0} 个才算健康（容忍 {1} 个挂）' -f $HealthPassThreshold, ($ProbeCount - $HealthPassThreshold))
+}
+Write-Log ("验证（晋升判据）：快判 + 确认(间隔 {0}s / {1}s，每轮 {2} 个探针须**全部**通过、单探针超时 {3}s，末轮含出口源地址确认)。" -f $ConfirmIntervalSeconds, $ThirdIntervalSeconds, $ProbeCount, $TimeoutSeconds)
+Write-Log ("健康检查（已连接后的判据）：每 {0}s 一轮、每轮 {1} 个探针（每轮：{2}）、单探针超时 {3}s；连续失败 {4} 次后降级切 Wi-Fi。" -f $HealthIntervalSeconds, $ProbeCount, $healthRule, $HealthTimeoutSeconds, $FailThreshold)
 Write-Log '健康检查路径：主用态直连探测（canary 天然走拨号，不装 /32 引导、不做出口确认）；停放态验证才用 /32 引导。'
 Write-Log '注意：本脚本只保证一直都有可用网络，可能会在校园网与热点之间切换，不保证游戏时的稳定性。' 'WARN'
 
@@ -858,7 +837,10 @@ try {
                 Write-Log ("健康检查：出错 —— {0}。按不健康处理，直接切 Wi-Fi。此前已健康 {1}。" -f $checkError, $healthyFor) 'ERROR'
             }
             else {
-                Write-Log ("健康检查：未通过 —— 通过 {0}/{1}（阈值 {2}）{3}。此前已健康 {4}。" -f $script:LastProbePassed, $script:LastProbeTotal, $HealthPassThreshold, $script:LastProbeMode, $healthyFor) 'WARN'
+                # 提前中止时 LastProbeTotal 会小于本轮应有的探针数，日志里说清楚，
+                # 免得看到"通过 0/1（阈值 2）"以为哪里不对。
+                $aborted = if ($script:LastProbeTotal -ge 0 -and $script:LastProbeTotal -lt $ProbeCount) { '，首个失败即中止' } else { '' }
+                Write-Log ("健康检查：未通过 —— 通过 {0}/{1}（本轮 {2} 个探针{3}）（{4}）。此前已健康 {5}。" -f $script:LastProbePassed, $script:LastProbeTotal, $ProbeCount, $aborted, $script:LastProbeMode, $healthyFor) 'WARN'
             }
             if ($consecutiveFailures -lt $FailThreshold) { continue }
 
