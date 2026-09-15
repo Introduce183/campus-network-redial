@@ -46,7 +46,8 @@ param(
     [string]$LogPath,
     [switch]$KeepParkedOnExit,
     [switch]$RestoreDialPriority,
-    [switch]$Status
+    [switch]$Status,
+    [switch]$StatusJson
 )
 
 Set-StrictMode -Version Latest
@@ -62,6 +63,17 @@ $script:LastProbeSummary = ''
 $script:LastProbeMode = ''
 $script:LastProbePassed = -1
 $script:LastProbeTotal = -1
+
+# 给 GUI / 外部脚本消费的状态（见 Get-StatusObject / Write-StatusFile）。
+$script:StatusFile = $null          # logs\status.json
+$script:StopFile = $null            # logs\stop.req —— 存在就优雅退出
+$script:RuntimeState = 'starting'   # starting/dialing/verifying/parked/primary/stopping
+$script:HealthySeconds = 0
+$script:LastCheckResult = ''
+# Wi-Fi 存活探测要 ping（约 1 秒），而状态文件每 3 秒就要写一次，所以缓存起来、
+# 最多 15 秒真探一次；真正做决策的路径（停放前、降级前）仍然直接调 Test-WifiAlive 拿实时值。
+$script:WifiAliveCache = $null
+$script:WifiAliveCheckedAt = [datetime]::MinValue
 
 # 在脚本作用域就把这两样取好，供 Restart-Elevated 使用（原因见该函数内的注释）。
 $script:ManagerPath = $PSCommandPath
@@ -605,10 +617,11 @@ function Test-DialExitPath {
 
 function Confirm-ExitPath {
     # 快判先行：坏出口在一轮内就被丢弃，省掉后面两段确认间隔的时间。
+    # 两段间隔（默认 12s / 30s）用 Wait-WithStop 等，这样停止请求不会卡在这段睡眠里。
     if (-not (Test-DialExitPath -Label '快判')) { return $false }
-    Start-Sleep -Seconds $ConfirmIntervalSeconds
+    if (-not (Wait-WithStop -Seconds $ConfirmIntervalSeconds)) { return $false }
     if (-not (Test-DialExitPath -Label '确认 1/2')) { return $false }
-    Start-Sleep -Seconds $ThirdIntervalSeconds
+    if (-not (Wait-WithStop -Seconds $ThirdIntervalSeconds)) { return $false }
     if (-not (Test-DialExitPath -Label '确认 2/2' -CheckEgress)) { return $false }
     return $true
 }
@@ -620,6 +633,79 @@ function Get-DialBackoffSeconds {
 }
 
 # ---------------------------------------------------------------- 状态
+
+function Test-StopRequested {
+    # GUI（或用户）可以通过创建 logs\stop.req 让管理器**优雅退出** ——
+    # 走 finally，该还原电话簿 / 清残留路由的都会做。直接杀进程则不会执行 finally。
+    if (-not $script:StopFile) { return $false }
+    return Test-Path -LiteralPath $script:StopFile
+}
+
+function Wait-WithStop {
+    param([int]$Seconds)
+    # 按秒切片地等，期间一出现停止请求就立刻返回 $false，让调用方去走优雅退出。
+    foreach ($i in 1..$Seconds) {
+        if (Test-StopRequested) { return $false }
+        Start-Sleep -Seconds 1
+    }
+    return $true
+}
+
+function Get-WifiAliveCached {
+    param([int]$MaxAgeSeconds = 15)
+    if ($null -ne $script:WifiAliveCache -and ((Get-Date) - $script:WifiAliveCheckedAt).TotalSeconds -lt $MaxAgeSeconds) {
+        return $script:WifiAliveCache
+    }
+    $script:WifiAliveCache = Test-WifiAlive
+    $script:WifiAliveCheckedAt = Get-Date
+    return $script:WifiAliveCache
+}
+
+function Get-StatusObject {
+    # 机器可读状态：-StatusJson 和 logs\status.json 共用这一份，避免两处口径不一致。
+    $dialIf = Get-DialInterface
+    $adapter = Get-WifiAdapter
+    $best = Get-BestDefaultRoute
+
+    $dialIp = $null
+    if ($dialIf) { $dialIp = Get-IPv4Address -InterfaceIndex $dialIf.ifIndex }
+    $wifiIp = $null
+    if ($adapter) { $wifiIp = Get-IPv4Address -InterfaceIndex $adapter.ifIndex }
+
+    [pscustomobject]@{
+        time               = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        state              = $script:RuntimeState
+        carrier            = (Get-CurrentPath)
+        # parkSwitch 与 dialHoldsDefault 必须分开报：电话簿说"停放"、而拨号仍握着默认路由，
+        # 正是之前"启动即报错"那个 bug 的形态，GUI 也要能看见这种不一致。
+        parkSwitch         = (Get-PbkValue -Text (Get-PbkText) -Key 'IpPrioritizeRemote')
+        dialHoldsDefault   = ($null -ne (Get-DialDefaultRoute))
+        dialConnected      = ($null -ne $dialIf)
+        dialName           = $DialName
+        dialIp             = $dialIp
+        wifiName           = $(if ($adapter) { $adapter.Name } else { $null })
+        wifiStatus         = $(if ($adapter) { [string]$adapter.Status } else { 'missing' })
+        wifiIp             = $wifiIp
+        wifiAlive          = (Get-WifiAliveCached)
+        bestDefaultIfIndex = $(if ($best) { $best.InterfaceIndex } else { $null })
+        bestDefaultAlias   = $(if ($best) { $best.InterfaceAlias } else { $null })
+        healthySeconds     = $script:HealthySeconds
+        lastCheck          = $script:LastCheckResult
+        logPath            = $script:LogFile
+    }
+}
+
+function Write-StatusFile {
+    # 给 GUI 轮询用。每轮健康检查写一次，成本可忽略；GUI 就不必每几秒 spawn 一个 powershell。
+    if (-not $script:StatusFile) { return }
+    try {
+        $json = Get-StatusObject | ConvertTo-Json -Depth 3
+        [System.IO.File]::WriteAllText($script:StatusFile, $json, [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        Write-Log ("写状态文件失败：{0}" -f $_.Exception.Message) 'WARN'
+    }
+}
 
 function Write-Status {
     $dialIf = Get-DialInterface
@@ -669,6 +755,16 @@ $logDir = Split-Path -Parent $LogPath
 if ($logDir -and -not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
 $script:LogFile = $LogPath
 $script:PbkBackup = Join-Path $logDir 'rasphone.pbk.bak'
+$script:StatusFile = Join-Path $logDir 'status.json'
+$script:StopFile = Join-Path $logDir 'stop.req'
+
+# -StatusJson：给 GUI / 脚本消费的机器可读状态。免提权可跑，和 -Status 一样只读。
+if ($StatusJson) {
+    # 一次性查询没有在跑循环，所以 state 报 idle 而不是循环里那个初始值 starting。
+    $script:RuntimeState = 'idle'
+    Get-StatusObject | ConvertTo-Json -Depth 3
+    exit 0
+}
 
 if ($Status) {
     Write-Host "拨号连接名：$DialName"
@@ -682,7 +778,17 @@ if (-not (Test-Elevated)) {
 }
 
 $mutex = [System.Threading.Mutex]::new($false, 'Local\CampusNetworkPath')
-if (-not $mutex.WaitOne(0)) {
+$mutexObtained = $false
+try {
+    $mutexObtained = $mutex.WaitOne(0)
+}
+catch [System.Threading.AbandonedMutexException] {
+    # 上一个实例是被硬杀的（没释放互斥体），OS 会把它标记成"遗弃"并在下次等待时抛异常。
+    # 既然是被遗弃的，就说明**没有实例在跑**，这里算正常拿到。
+    # 不处理这一条会自我锁死：管理器每次启动都直接死在这一行。
+    $mutexObtained = $true
+}
+if (-not $mutexObtained) {
     Write-Host '已经有一个网络管理器在运行，本次退出。' -ForegroundColor Yellow
     exit 1
 }
@@ -747,7 +853,17 @@ if (-not (Test-WifiAlive)) {
     exit 1
 }
 
-# 一次性安装停放开关：把 IpPrioritizeRemote 改成 0，让拨号不再抢默认路由。
+# 确保进入"停放态"：电话簿开关必须是 0，而且**拨号不能握着默认路由**。
+#
+# 这里刻意不再用"电话簿开关的值"去推断"会话是不是停放态"，因为这两件事会脱节：
+#   1) 拨号会话是 RAS 在**连接时**读 IpPrioritizeRemote 决定的 —— 值改了但没重连，旧会话照样握着默认路由；
+#   2) 上一次运行"晋升"时用 New-NetRoute 给拨号加的那条默认路由是**运行时残留**，
+#      退出（尤其被硬杀）不会自动消失，也不受电话簿开关控制。
+# 判据改成"拨号实际有没有默认路由"这个行为事实。只要它握着，就重连一次：
+# 重连会销毁并重建 PPP 接口，接口上 ActiveStore 的残留路由会跟着一起消失 ——
+# 于是"陈旧会话"和"残留路由"两个问题一次解决，也不会再出现"每次启动都失败"的死锁。
+$needRestart = $false
+
 if ((Get-PbkValue -Text (Get-PbkText) -Key 'IpPrioritizeRemote') -ne '0') {
     Write-Log '安装停放开关：IpPrioritizeRemote -> 0（改完需要重连一次让 RAS 生效）'
     if (-not (Set-ParkSetting -Value '0')) {
@@ -755,14 +871,22 @@ if ((Get-PbkValue -Text (Get-PbkText) -Key 'IpPrioritizeRemote') -ne '0') {
         $mutex.ReleaseMutex(); $mutex.Dispose()
         exit 1
     }
-    [void](Restart-Dialup)
+    $needRestart = $true
+}
+elseif ($null -ne (Get-DialDefaultRoute)) {
+    Write-Log '拨号会话仍握着默认路由（多半是上一次晋升留下的残留路由，或该会话是用旧设置拨上的），重连一次清理。' 'WARN'
+    $needRestart = $true
 }
 
-# 装完必须复查：如果拨号仍然带着默认路由，说明停放开关没生效，
-# 那就无法保证"验证期间走 Wi-Fi"，宁可退出也不要带着错误假设跑。
-$stillHasDefault = $null -ne (Get-DialDefaultRoute)
-if ($stillHasDefault) {
-    Write-Log '停放开关已写入但拨号仍抢默认路由（IpPrioritizeRemote 未生效），退出。' 'ERROR'
+if ($needRestart) {
+    if (-not (Restart-Dialup)) {
+        Write-Log '拨号重连失败，下面会再复查一次停放是否真的生效。' 'WARN'
+    }
+}
+
+# 复查：拨号必须没有默认路由，否则"验证期间走 Wi-Fi"这个假设不成立，宁可退出也不要带着错假设跑。
+if ($null -ne (Get-DialDefaultRoute)) {
+    Write-Log '拨号仍握着默认路由，无法确认停放已生效（多半是上面那次重连失败），为安全起见退出。' 'ERROR'
     $mutex.ReleaseMutex(); $mutex.Dispose()
     exit 1
 }
@@ -771,6 +895,14 @@ if ($parkDialIf) {
     Write-Log ('停放开关已生效：拨号已连接 {0}，且不抢默认路由。' -f (Get-IPv4Address -InterfaceIndex $parkDialIf.ifIndex)) 'OK'
 }
 
+# 清掉上次遗留的停止请求（否则一启动就会被它立刻停掉），然后把初始状态写给 GUI。
+if (Test-Path -LiteralPath $script:StopFile) {
+    Write-Log '发现上次遗留的停止请求文件，清掉它。' 'WARN'
+    Remove-Item -LiteralPath $script:StopFile -Force -ErrorAction SilentlyContinue
+}
+$script:RuntimeState = 'parked'
+Write-StatusFile
+
 $dialFailCount = 0
 $nextDelay = 0
 $consecutiveFailures = 0
@@ -778,17 +910,30 @@ $badExitCount = 0
 
 try {
     while ($true) {
+        # 优雅停止：GUI 会创建 logs\stop.req 来要求退出（直接杀进程不会执行 finally，
+        # 电话簿会留在停放态、晋升残留路由也会留下）。
+        if (Test-StopRequested) {
+            Write-Log '收到停止请求（logs\stop.req），优雅退出。' 'WARN'
+            break
+        }
+
         if (-not (Test-DialConnected)) {
             if ($nextDelay -gt 0) {
                 Write-Log ("{0} 秒后重新拨号。" -f $nextDelay)
-                Start-Sleep -Seconds $nextDelay
+                if (-not (Wait-WithStop -Seconds $nextDelay)) {
+                    Write-Log '收到停止请求，优雅退出。' 'WARN'
+                    break
+                }
                 $nextDelay = 0
             }
+            $script:RuntimeState = 'dialing'
+            Write-StatusFile
             Write-Log '开始拨号。'
             if (-not (Connect-Dialup)) {
                 $dialFailCount++
                 $nextDelay = Get-DialBackoffSeconds -FailCount $dialFailCount
                 Write-Log ("连续第 {0} 次拨号失败，退避 {1} 秒。" -f $dialFailCount, $nextDelay) 'WARN'
+                Write-StatusFile
                 continue
             }
             $dialFailCount = 0
@@ -815,6 +960,10 @@ try {
             continue
         }
 
+        $script:RuntimeState = 'primary'
+        $script:LastCheckResult = '刚晋升'
+        $script:HealthySeconds = 0
+        Write-StatusFile
         Write-Log ("好了喵 —— 拨号已确认为可用出口并成为主用（当前承载：{0}）。" -f (Get-CurrentPath)) 'OK'
         $dialFailCount = 0
         $nextDelay = 0
@@ -827,7 +976,13 @@ try {
         $failedBefore = $false
 
         while ($true) {
-            Start-Sleep -Seconds $HealthIntervalSeconds
+            # 用切片等待，这样 GUI 的停止请求（logs\stop.req）最多 1 秒内就会被响应。
+            if (-not (Wait-WithStop -Seconds $HealthIntervalSeconds)) {
+                Write-Log '收到停止请求，优雅退出。' 'WARN'
+                break
+            }
+
+            $script:HealthySeconds = [int](((Get-Date) - $healthySince).TotalSeconds)
 
             if (-not (Test-DialConnected)) {
                 Write-Log '拨号连接已断开。' 'WARN'
@@ -849,6 +1004,8 @@ try {
             }
 
             if ($healthy) {
+                $script:LastCheckResult = ('通过 {0}/{1}' -f $script:LastProbePassed, $script:LastProbeTotal)
+                Write-StatusFile
                 if ($failedBefore) {
                     Write-Log ("健康检查：已恢复 —— {0}（{1}）。本段从 {2} 重新计时。" -f $script:LastProbeSummary, $script:LastProbeMode, (Get-Date -Format 'HH:mm:ss')) 'OK'
                     $failedBefore = $false
@@ -863,6 +1020,8 @@ try {
 
             $consecutiveFailures++
             $failedBefore = $true
+            $script:LastCheckResult = ('未通过 {0}/{1}' -f $script:LastProbePassed, $script:LastProbeTotal)
+            Write-StatusFile
             $healthyFor = Format-Duration ((Get-Date) - $healthySince)
             if ($checkError) {
                 Write-Log ("健康检查：出错 —— {0}。按不健康处理，直接切 Wi-Fi。此前已健康 {1}。" -f $checkError, $healthyFor) 'ERROR'
@@ -894,6 +1053,8 @@ try {
                 Disconnect-Dialup
                 $nextDelay = 0
             }
+            $script:RuntimeState = 'parked'
+            Write-StatusFile
             break
         }
 
@@ -902,18 +1063,55 @@ try {
 }
 finally {
     Clear-HealthLine
+    $script:RuntimeState = 'stopping'
+    Write-StatusFile
     # 不留副作用：把停放开关还原，让用户在没有管理器时也能正常用拨号。
     $cur = Get-PbkValue -Text (Get-PbkText) -Key 'IpPrioritizeRemote'
     if ($cur -eq '0') {
         if ($KeepParkedOnExit) {
-            Write-Log '按 -KeepParkedOnExit 保留停放开关（IpPrioritizeRemote=0）。'
+            # "保留停放"必须是真的没在承载：晋升时用 New-NetRoute 加的那条默认路由是**运行时残留**，
+            # 不会自己消失（它只存在于 ActiveStore，跟电话簿开关无关）。留着它＝拨号仍在抢默认路由，
+            # 名义上"停放"、实际还在用拨号 —— 而且下次启动时它会喂给停放守卫，造成启动即报错的死锁。
+            if ($null -ne (Get-DialDefaultRoute)) {
+                Write-Log '按 -KeepParkedOnExit 保留停放开关；先删掉上一次晋升留下的拨号默认路由，让它真正停放。'
+                [void](Enter-Parked)
+            }
+            else {
+                Write-Log '按 -KeepParkedOnExit 保留停放开关（IpPrioritizeRemote=0）。'
+            }
+            # 停放态应该是"拨号连着、但不承载"。要是正好停在"断开换出口"的中间，这里补拨一次。
+            if (-not (Test-DialConnected)) {
+                Write-Log '退出时拨号是断开的，补拨一次让它保持"连着但不抢默认路由"。'
+                [void](Connect-Dialup)
+            }
         }
         else {
             Write-Log '还原停放开关：IpPrioritizeRemote -> 1，并重连让 RAS 生效。'
-            [void](Set-ParkSetting -Value '1')
-            if (Test-DialConnected) { [void](Restart-Dialup) }
+            if (-not (Set-ParkSetting -Value '1')) {
+                Write-Log '写回电话簿失败；稍后可以用 -RestoreDialPriority 手动恢复。' 'ERROR'
+            }
+            elseif (Test-DialConnected) {
+                # 重连会重建 PPP 接口，晋升留下的残留路由也会随之消失。
+                if (-not (Restart-Dialup)) {
+                    Write-Log '重连失败；电话簿已是 1，拨号下次连上时会成为默认网关。' 'WARN'
+                }
+            }
+            else {
+                # 退出时拨号可能是断的（正好卡在"断开换出口"的中间），用户看到的就是"退出后没有拨号"。
+                # 电话簿已经是 1，这里补拨一次，让"退出即拨号优先"在行为上真的成立。
+                Write-Log '退出时拨号是断开的，补拨一次让它成为默认网关。'
+                if (-not (Connect-Dialup)) {
+                    Write-Log '补拨失败；电话簿已是 1，下次拨上时会自动成为默认网关。' 'WARN'
+                }
+            }
         }
     }
+    # 清掉停止请求文件，否则下次启动会被它立刻停掉。
+    if (Test-Path -LiteralPath $script:StopFile) {
+        Remove-Item -LiteralPath $script:StopFile -Force -ErrorAction SilentlyContinue
+    }
+    $script:RuntimeState = 'stopped'
+    Write-StatusFile
     Write-Log ("网络管理器退出。当前承载：{0}" -f (Get-CurrentPath))
     $mutex.ReleaseMutex()
     $mutex.Dispose()

@@ -6,6 +6,17 @@
 #     管理器要改电话簿里的 IpPrioritizeRemote、要加删默认路由和 /32 引导路由，
 #     这些都需要管理员权限。Run 键没法让进程提权，用 Run 键启会每次登录弹一次 UAC，
 #     所以只能用"以最高权限运行"的计划任务。
+#
+# 三种用法：
+#   1) 无参数                    → 交互菜单（原来的行为）
+#   2) -StatusJson               → 打印两个条目的开关状态（JSON，给 GUI 读）
+#   3) -ManagerAutostart On|Off  → 非交互地开关"网络管理器"这一项（GUI 用）
+[CmdletBinding()]
+param(
+    [ValidateSet('', 'On', 'Off')] [string]$ManagerAutostart = '',
+    [switch]$StatusJson
+)
+
 $ErrorActionPreference = 'Stop'
 
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -19,9 +30,13 @@ $managerPath = Join-Path $PSScriptRoot 'Switch-NetworkPath.ps1'
 # 想让退出后一直待在 Wi-Fi 上，才需要加 -KeepParkedOnExit。
 $managerTaskArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}"'
 
-# 必须在脚本作用域取好：函数内部的 $MyInvocation.MyCommand 是那个函数本身而不是脚本文件，
-# 取 .Path 在 StrictMode 下会直接抛 "在此对象上找不到属性 Path"。
+# 必须在脚本作用域取好两样：
+#   - $script:SelfPath：函数内部的 $MyInvocation.MyCommand 是那个函数本身而不是脚本文件，
+#     取 .Path 在 StrictMode 下会直接抛 "在此对象上找不到属性 Path"。
+#   - $script:SubmitArgs：函数里的 $PSBoundParameters 指的是本函数的参数（空集），
+#     不在脚本作用域先取好，提权重启时参数会被丢掉（-ManagerAutostart 就白传了）。
 $script:SelfPath = $PSCommandPath
+$script:SubmitArgs = $PSBoundParameters
 
 function Test-Elevated {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -35,8 +50,18 @@ function Restart-Elevated {
         Write-Host '拿不到脚本自身路径，请用管理员身份手动运行本脚本。' -ForegroundColor Red
         return
     }
-    Start-Process -FilePath 'powershell.exe' -Verb RunAs `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:SelfPath)
+    # 把这次收到的参数一起传给提权后的实例，否则 -ManagerAutostart / -StatusJson 会被丢掉。
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:SelfPath)
+    foreach ($key in $script:SubmitArgs.Keys) {
+        $value = $script:SubmitArgs[$key]
+        if ($value -is [switch]) {
+            if ($value.IsPresent) { $arguments += "-$key" }
+        }
+        elseif ("$value" -ne '') {
+            $arguments += @("-$key", "$value")
+        }
+    }
+    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList $arguments
     Start-Sleep -Seconds 1
 }
 
@@ -85,6 +110,18 @@ function Remove-LegacyManagerRunKey {
     return $false
 }
 
+# -StatusJson 是只读的（读 Run 键和计划任务都不需要管理员权限），所以放在提权检查之前 ——
+# 免得只想问一句状态就弹一次 UAC。
+if ($StatusJson) {
+    [pscustomobject]@{
+        redial      = (Test-RedialEnabled)
+        manager     = (Test-ManagerEnabled)
+        taskName    = $taskName
+        runKeyValue = 'CampusNetworkRedial'
+    } | ConvertTo-Json -Depth 3
+    exit 0
+}
+
 if (-not (Test-Elevated)) {
     Restart-Elevated
     exit 0
@@ -94,6 +131,24 @@ $migrated = Remove-LegacyManagerRunKey
 
 foreach ($path in @($redialPath, $managerPath)) {
     if (-not (Test-Path -LiteralPath $path)) { throw "找不到脚本：$path" }
+}
+
+# ---- 非交互模式（GUI 调用）：开关"网络管理器"自启 --------------------------------
+if ($ManagerAutostart -ne '') {
+    $want = ($ManagerAutostart -eq 'On')
+    $have = Test-ManagerEnabled
+    if ($have -eq $want) {
+        Write-Host ("网络管理器自启已经是 {0} 状态，无需改动。" -f $ManagerAutostart)
+        exit 0
+    }
+    Set-ManagerEnabled -Enabled $want
+    $now = Test-ManagerEnabled
+    if ($now -eq $want) {
+        Write-Host ("网络管理器自启已{0}。" -f $(if ($want) { '开启' } else { '关闭' }))
+        exit 0
+    }
+    Write-Host ("设置失败：期望 {0}，实际 {1}。" -f $want, $now) -ForegroundColor Red
+    exit 1
 }
 
 while ($true) {
