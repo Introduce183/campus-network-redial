@@ -17,8 +17,13 @@ echo.
 echo Log file: logs\network-path.log
 echo Press Ctrl+C in the manager window to stop it.
 echo.
+echo Launched with -KeepParkedOnExit: after the manager stops,
+echo the phonebook stays parked (the dial connects but does not
+echo claim the default route), so this machine stays on Wi-Fi.
+echo See README for how to go back to dial-first.
+echo.
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Switch-NetworkPath.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Switch-NetworkPath.ps1" -KeepParkedOnExit
 
 echo.
 echo If a UAC prompt was accepted, the manager is now running

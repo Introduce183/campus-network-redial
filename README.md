@@ -51,9 +51,31 @@ powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1 -Status
 
 同一时刻只允许一个实例在跑，重复启动会被互斥体挡掉。
 
-> ⚠️ **如果管理器被硬杀（直接关窗口 / 结束进程），电话簿里的开关会留在 `0`**，此时拨号连上也不会当默认网关 —— 也就是你会一直在 Wi-Fi 上。想恢复：重跑一次管理器，或者跑
-> `powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1 -Status` 看状态。管理器正常 `Ctrl+C` 退出时会自动还原。
-> 不想还原（例如你想让它一直待在 Wi-Fi 上）可以用 `-KeepParkedOnExit`。
+> ### ⚠️ 退出后电话簿开关会怎样
+>
+> `Switch-NetworkPath.bat`（以及开机自启的计划任务）都是带 **`-KeepParkedOnExit`** 启动的，
+> 意思是：**管理器一停，电话簿里的停放开关就留在 `0`** —— 拨号仍然能连上，但不再抢默认路由，
+> 于是机器继续待在 Wi-Fi 上，不会自己跳回拨号出口，也不会因为"被硬杀"而漏掉还原动作。
+>
+> 代价是**这个开关不会自动还原了**，想回到"拨号优先"得手动做，见下面「怎么退出后回到拨号优先」。
+
+### 怎么退出后回到拨号优先
+
+停放开关是电话簿里的 `IpPrioritizeRemote`，`0` = 拨号不抢默认路由，`1` = 拨号当默认网关。恢复方式：
+
+1. 跑一次**不带** `-KeepParkedOnExit` 的管理器（它会先装停放开关、再在退出时还原成 `1` 并重连）：
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1
+   ```
+   让它跑几秒，然后 `Ctrl+C` —— 退出时会自动把开关还原成 `1`。
+2. 想确认当前值，随时跑 `-Status`，第一段就是：
+
+   ```text
+   --- 电话簿（停放开关）---
+     IpPrioritizeRemote = 0   （0 = 拨号不抢默认路由 / 停放态；1 = 拨号当默认网关）
+   ```
+
+停放在 `0` 期间拨号**仍然可以正常拨上**（`rasdial` 能连、能拿到 IP），只是它不承载你的流量 —— 管理器就是靠这一点在后台验证新出口的。
 
 ### 只检测当前出口（不拨号）
 
@@ -99,6 +121,15 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -HighBand
 两者不要同时开，它们会互相抢 `rasdial`。建议只开网络管理器。
 
 管理器之所以用计划任务而不是 Run 键：它必须提权才能改电话簿和路由，而 Run 键没法让进程提权，用 Run 键启会每次登录弹一次 UAC。
+
+计划任务的动作参数是：
+
+```text
+-NoProfile -ExecutionPolicy Bypass -File "E:\campus-network-redial\Switch-NetworkPath.ps1" -KeepParkedOnExit
+```
+
+末尾的 `-KeepParkedOnExit` 是特意加的（和 `Switch-NetworkPath.bat` 一致）：管理器退出或被关掉后，电话簿保持停放，机器留在 Wi-Fi 上。
+想改成退出即还原拨号优先，把 `Set-AutoStart.ps1` 里的 `$managerTaskArgs` 末尾那段删掉、再重开一次自启即可。
 
 ## 判定逻辑
 
@@ -208,7 +239,7 @@ IpPrioritizeRemote=0     ← "在远程网络上使用默认网关" 关掉
 | `-FailThreshold` | 1 | 连续几轮不健康才降级；默认 1 = 一轮不过就切回 Wi-Fi |
 | `-PauseSeconds` | 2 | 坏出口后重新拨号前的停顿 |
 | `-MaxDialBackoffSeconds` | 60 | 拨号失败时的退避上限 |
-| `-KeepParkedOnExit` | 关 | 退出时不还原电话簿开关（保持停放）|
+| `-KeepParkedOnExit` | 关 | 退出时不还原电话簿开关（保持停放=一直待在 Wi-Fi）。`Switch-NetworkPath.bat` 和开机自启的计划任务都默认带上它 |
 | `-LogPath` | `logs\network-path.log` | 日志路径 |
 | `-Status` | — | 只打印当前状态，不进循环（免提权可跑）|
 
