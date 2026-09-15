@@ -7,3 +7,7 @@ logs/
 
 # 桌面快捷方式
 *.lnk
+
+# 本地自用的双出口对比测试脚本，不发布
+Test-BothExits.ps1
+Test-BothExits.bat
