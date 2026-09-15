@@ -39,6 +39,7 @@ param(
     [ValidateRange(0, 600)] [int]$ThirdIntervalSeconds = 30,
     [ValidateRange(1, 3600)] [int]$HealthIntervalSeconds = 3,
     [ValidateRange(1, 10)] [int]$HealthPassThreshold = 2,
+    [ValidateRange(1, 60)] [int]$HealthTimeoutSeconds = 2,
     [ValidateRange(1, 100)] [int]$FailThreshold = 1,
     [ValidateRange(1, 600)] [int]$PauseSeconds = 2,
     [ValidateRange(1, 3600)] [int]$MaxDialBackoffSeconds = 60,
@@ -471,14 +472,21 @@ function Remove-SteerRoute {
 }
 
 function Get-RatifiedProbeResult {
+    # 探针脚本零修改：只调用它、读它的输出。
+    return Invoke-ProbeRound -Count $ProbeCount -Timeout $TimeoutSeconds
+}
+
+function Invoke-ProbeRound {
+    param([int]$Count, [int]$Timeout)
+
     $probe = Join-Path $PSScriptRoot 'Test-CampusExit.ps1'
-    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe -TimeoutSeconds $TimeoutSeconds -Count $ProbeCount 2>&1 | Out-String
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $probe -TimeoutSeconds $Timeout -Count $Count 2>&1 | Out-String
     $passed = ($LASTEXITCODE -eq 0)
     $summary = @($output -split "`r?`n" | Where-Object { $_ -match 'probe passed' } | Select-Object -Last 1)
     if ($summary.Count -gt 0) { $summary = $summary[0].Trim() } else { $summary = '（探针没有输出结果行）' }
 
-    # 从探针输出里把"通过几个 / 共几个"抠出来（探针脚本本身零修改，只读它的输出）。
-    # 健康检查要用"多数即算健康"的判据，光有退出码不够。
+    # 从探针输出里把"通过几个 / 共几个"抠出来。健康检查要用"多数即算健康"和"早停"，
+    # 光有退出码不够。抠不出来时 PassedCount 保持 -1，调用方退回退出码语义。
     $passedCount = -1
     $totalCount = -1
     $m = [regex]::Match($summary, 'probe passed (\d+) of (\d+)')
@@ -489,81 +497,118 @@ function Get-RatifiedProbeResult {
     return [pscustomobject]@{ Passed = $passed; Summary = $summary; PassedCount = $passedCount; TotalCount = $totalCount }
 }
 
-function Test-DialExitPath {
-    # PassThreshold：需要几个探针通过才算这一轮通过。
-    #   传 0（默认）＝ 全部通过，这是**晋升判定**用的严格判据，别动。
-    #   健康检查传多数阈值（见 -HealthPassThreshold），因为单次偶发超时不该直接判死。
-    param([string]$Label, [switch]$CheckEgress, [switch]$Quiet, [int]$PassThreshold = 0)
+function Test-HealthRound {
+    # 健康检查专用：主用态下直连探测（拨号自己握着默认路由，canary 天然走拨号），
+    # 并且**一旦这一轮已经不可能达标就立刻停手**，不再等剩下的探针超时。
+    #
+    # 为什么分两次调用探针：探针是 $uris[(i-1) % 2] 轮转的，所以
+    #   -Count 2  -> abvolcapi, apiv2   （两个主机都覆盖到）
+    #   -Count 1  -> abvolcapi
+    # 合起来和 -Count 3 覆盖的 canary 完全一致，判据也一样 ——
+    # 只是"两个都挂"时能省掉第三个探针的一整个超时。
+    #
+    # Timeout 用 HealthTimeoutSeconds（默认 2），比晋升验证用的 4 秒短：
+    # 实测健康出口的单个探针只要 ~0.2 秒，2 秒已是 10 倍余量，
+    # 而坏出口的等待能从 3x4=12 秒压到 2x2=4 秒。
+    $dialIf = Get-DialInterface
+    if (-not $dialIf) { Write-Log '拨号未连接，无法探测。' 'WARN'; return $false }
 
-    if ($PassThreshold -le 0) { $PassThreshold = $ProbeCount }
+    # 廉价断言：最优默认路由必须在拨号上。否则探针会溜到 Wi-Fi 上，得出假的"健康"。
+    $best = Get-BestDefaultRoute
+    if (-not $best -or $best.InterfaceAlias -ne $DialName) {
+        Write-Log ('健康检查：最优默认路由不在拨号上（{0}），本轮不通过。' -f $(if ($best) { $best.InterfaceAlias } else { '无' })) 'ERROR'
+        return $false
+    }
+
+    $total = $ProbeCount
+    $threshold = [Math]::Min($HealthPassThreshold, $total)
+
+    if ($total -ne 3) {
+        # 只有 3 个探针时上面的 2+1 拆分才和轮转对得上；其它数量就别早停，老实跑完。
+        $r = Invoke-ProbeRound -Count $total -Timeout $HealthTimeoutSeconds
+        $script:LastProbeSummary = $r.Summary
+        $script:LastProbeMode = '直连探测'
+        $script:LastProbePassed = $r.PassedCount
+        $script:LastProbeTotal = $r.TotalCount
+        if ($r.PassedCount -ge 0) { return ($r.PassedCount -ge $threshold) }
+        return $r.Passed
+    }
+
+    $r1 = Invoke-ProbeRound -Count 2 -Timeout $HealthTimeoutSeconds
+    if ($r1.PassedCount -lt 0) {
+        # 抠不出计数就退回退出码语义。这种时候不能保证早停判断正确，老实把第三个也跑完。
+        $r2 = Invoke-ProbeRound -Count 1 -Timeout $HealthTimeoutSeconds
+        $script:LastProbeSummary = $r2.Summary
+        $script:LastProbeMode = '直连探测'
+        $script:LastProbePassed = -1
+        $script:LastProbeTotal = $total
+        return ($r1.Passed -and $r2.Passed)
+    }
+
+    $passed = $r1.PassedCount
+    # 还剩 1 个探针没跑。把它的最好情况也算上仍达不到阈值，就是已经判死了 → 早停。
+    if (($passed + 1) -lt $threshold) {
+        $script:LastProbeSummary = ('Campus exit probe passed {0} of 2（早停，未跑第 3 个）' -f $passed)
+        $script:LastProbeMode = '直连探测'
+        $script:LastProbePassed = $passed
+        $script:LastProbeTotal = $total
+        return $false
+    }
+
+    $r3 = Invoke-ProbeRound -Count 1 -Timeout $HealthTimeoutSeconds
+    $passed += $r3.PassedCount
+    $script:LastProbeSummary = ('Campus exit probe passed {0} of {1}（2+1 分段探测）' -f $passed, $total)
+    $script:LastProbeMode = '直连探测'
+    $script:LastProbePassed = $passed
+    $script:LastProbeTotal = $total
+    return ($passed -ge $threshold)
+}
+
+function Test-DialExitPath {
+    # 验证"停放中的拨号出口"（快判 / 确认 用）。
+    #
+    # 此刻拨号没有默认路由，探针会跟着默认路由走 Wi-Fi，所以必须给 canary 的 IPv4 装
+    # /32 主机路由指向拨号接口，测的才是拨号出口。
+    #
+    # 判据用最严格的一档：这一轮 ProbeCount 个探针必须**全部**通过 —— 这是晋升基准，别动。
+    # 健康检查不在这个函数里，见 Test-HealthRound（它跑在主用态、不需要引导、而且会早停）。
+    param([string]$Label, [switch]$CheckEgress)
 
     $dialIf = Get-DialInterface
     if (-not $dialIf) { Write-Log '拨号未连接，无法探测。' 'WARN'; return $false }
 
-    # 是否需要用 /32 把 canary 引导到拨号。
-    #
-    # 主用态（拨号自己握着最优默认路由）时**不需要**引导：canary 天然走拨号。
-    # 省掉这一段能砍掉每轮 18 次路由表操作 —— 健康检查设成几秒一次就必须省，
-    # 否则每分钟要做约 170 次路由增删。这时用一个廉价断言代替：
-    # 确认最优默认路由确实是拨号（读一次路由表），拿不准就当本轮不通过。
-    #
-    # 停放态（Wi-Fi 握着默认路由）时必须引导，否则探针会测到 Wi-Fi 的出口。
-    $needSteering = (Get-CurrentPath) -ne 'pppoe'
-    $mode = if ($needSteering) { '/32 引导' } else { '直连探测' }
-
-    if (-not $needSteering) {
-        # 再确认一次拨号的最优默认路由确实在表里 —— 万一它的默认路由被别人删了，
-        # 探针就会溜到 Wi-Fi 上，那样会得出假的"通过"。
-        $best = Get-BestDefaultRoute
-        if (-not $best -or $best.InterfaceAlias -ne $DialName) {
-            Write-Log ("{0}：最优默认路由不在拨号上（{1}），本轮不通过。" -f $Label, $(if ($best) { $best.InterfaceAlias } else { '无' })) 'ERROR'
-            return $false
-        }
-    }
+    $targets = Resolve-CanaryIpv4
+    if ($targets.Count -eq 0) { Write-Log 'canary 一个 IPv4 都解析不出来。' 'ERROR'; return $false }
 
     $installed = @()
-    if ($needSteering) {
-        $targets = Resolve-CanaryIpv4
-        if ($targets.Count -eq 0) { Write-Log 'canary 一个 IPv4 都解析不出来。' 'ERROR'; return $false }
-
-        foreach ($ip in $targets) {
-            if (Add-SteerRoute -Address $ip -InterfaceIndex $dialIf.ifIndex) { $installed += $ip }
-        }
-        if ($installed.Count -ne $targets.Count) {
-            foreach ($ip in $installed) { Remove-SteerRoute -Address $ip -InterfaceIndex $dialIf.ifIndex }
-            Write-Log '引导路由没装全，本轮不通过（不能相信探测结果）。' 'ERROR'
-            return $false
-        }
+    foreach ($ip in $targets) {
+        if (Add-SteerRoute -Address $ip -InterfaceIndex $dialIf.ifIndex) { $installed += $ip }
+    }
+    if ($installed.Count -ne $targets.Count) {
+        foreach ($ip in $installed) { Remove-SteerRoute -Address $ip -InterfaceIndex $dialIf.ifIndex }
+        Write-Log '引导路由没装全，本轮不通过（不能相信探测结果）。' 'ERROR'
+        return $false
     }
 
     try {
-        if ($needSteering) {
-            # 断言：直接读表确认每个 /32 都在拨号接口上。/32 是最具体前缀，必然胜过默认路由。
-            foreach ($ip in $installed) {
-                $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$ip/32" -InterfaceIndex $dialIf.ifIndex -ErrorAction SilentlyContinue
-                if (-not $r) {
-                    Write-Log ("引导断言失败：{0}/32 不在拨号接口上，本轮不通过。" -f $ip) 'ERROR'
-                    return $false
-                }
+        # 断言：直接读表确认每个 /32 都在拨号接口上。/32 是最具体前缀，必然胜过默认路由。
+        foreach ($ip in $installed) {
+            $r = Get-NetRoute -AddressFamily IPv4 -DestinationPrefix "$ip/32" -InterfaceIndex $dialIf.ifIndex -ErrorAction SilentlyContinue
+            if (-not $r) {
+                Write-Log ("引导断言失败：{0}/32 不在拨号接口上，本轮不通过。" -f $ip) 'ERROR'
+                return $false
             }
         }
 
         $result = Get-RatifiedProbeResult
-        # 把结果与模式留在脚本作用域，供 -Quiet 的调用方（健康检查）取用。
         $script:LastProbeSummary = $result.Summary
-        $script:LastProbeMode = $mode
+        $script:LastProbeMode = '/32 引导'
         $script:LastProbePassed = $result.PassedCount
         $script:LastProbeTotal = $result.TotalCount
 
-        # 通过判定：抠得出计数就按阈值比（健康检查用"多数即健康"），
-        # 抠不出就退回退出码语义（全部通过）。
-        $ok = if ($result.PassedCount -ge 0) { $result.PassedCount -ge $PassThreshold } else { $result.Passed }
-
-        if (-not $Quiet) {
-            if ($ok) { Write-Log ("{0}：通过 —— {1}（{2}）" -f $Label, $result.Summary, $mode) }
-            else { Write-Log ("{0}：未通过 —— {1}（{2}）" -f $Label, $result.Summary, $mode) 'WARN' }
-        }
-        if (-not $ok) { return $false }
+        if ($result.Passed) { Write-Log ("{0}：通过 —— {1}（/32 引导）" -f $Label, $result.Summary) }
+        else { Write-Log ("{0}：未通过 —— {1}（/32 引导）" -f $Label, $result.Summary) 'WARN' }
+        if (-not $result.Passed) { return $false }
 
         if ($CheckEgress) {
             # 行为闸：确认探针确实从拨号出口发出（DNS 解析到没被 /32 覆盖的 IP 也能被抓到）。
@@ -675,8 +720,8 @@ $wifiLabel = if ($wifiAdapter) { $wifiAdapter.Name } else { '无' }
 Write-Log '==================== 网络管理器启动 ===================='
 Write-Log ("拨号：{0}；Wi-Fi：{1}；当前承载：{2}；canary：{3}" -f $DialName, $wifiLabel, (Get-CurrentPath), ($script:CanaryUris -join ' '))
 Write-Log ("验证（晋升判据）：快判 + 确认(间隔 {0}s / {1}s，每轮 {2} 个探针须**全部**通过，末轮含出口源地址确认)。" -f $ConfirmIntervalSeconds, $ThirdIntervalSeconds, $ProbeCount)
-Write-Log ("健康检查（已连接后的判据）：每 {0}s 一轮、每轮 {1} 个探针，通过 >= {2} 个即算健康；低于阈值就连续失败 {3} 次后降级切 Wi-Fi（默认为 1，也就是一轮不过就切）。" -f $HealthIntervalSeconds, $ProbeCount, $HealthPassThreshold, $FailThreshold)
-Write-Log ("健康检查路径：主用态直连探测（省掉 /32 引导与出口确认，避免每 {0}s 做一轮路由增删）；停放态用 /32 引导。" -f $HealthIntervalSeconds)
+Write-Log ("健康检查（已连接后的判据）：每 {0}s 一轮、每轮 {1} 个探针（分段跑，一旦凑不到 {2} 个通过就立刻停手）、探针超时 {3}s；通过 >= {2} 个即算健康，低于阈值就连续失败 {4} 次后降级切 Wi-Fi。" -f $HealthIntervalSeconds, $ProbeCount, $HealthPassThreshold, $HealthTimeoutSeconds, $FailThreshold)
+Write-Log '健康检查路径：主用态直连探测（canary 天然走拨号，不装 /32 引导、不做出口确认）；停放态验证才用 /32 引导。'
 Write-Log '注意：本脚本只保证一直都有可用网络，可能会在校园网与热点之间切换，不保证游戏时的稳定性。' 'WARN'
 
 # 硬前提：Wi-Fi（热点）必须是可用的。
@@ -787,7 +832,7 @@ try {
             $healthy = $false
             $checkError = $null
             try {
-                $healthy = Test-DialExitPath -Label '健康检查' -Quiet -PassThreshold $HealthPassThreshold
+                $healthy = Test-HealthRound
             }
             catch {
                 $checkError = $_.Exception.Message
