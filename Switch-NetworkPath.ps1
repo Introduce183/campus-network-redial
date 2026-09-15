@@ -45,6 +45,7 @@ param(
     [ValidateRange(1, 3600)] [int]$MaxDialBackoffSeconds = 60,
     [string]$LogPath,
     [switch]$KeepParkedOnExit,
+    [switch]$RestoreDialPriority,
     [switch]$Status
 )
 
@@ -684,6 +685,36 @@ $mutex = [System.Threading.Mutex]::new($false, 'Local\CampusNetworkPath')
 if (-not $mutex.WaitOne(0)) {
     Write-Host '已经有一个网络管理器在运行，本次退出。' -ForegroundColor Yellow
     exit 1
+}
+
+# 一次性"恢复拨号优先级"：正常退出时 finally 会自动还原，但如果管理器是被硬杀的
+# （关窗口 / 结束进程），finally 不会执行，电话簿就会留在停放态（IpPrioritizeRemote=0）
+# —— 最直接的后果是拨号再也不抢默认路由，机器一直待在 Wi-Fi 上。
+# 这个开关就是那种情况下的恢复入口：把开关写回 1 并重连。
+if ($RestoreDialPriority) {
+    $curVal = Get-PbkValue -Text (Get-PbkText) -Key 'IpPrioritizeRemote'
+    Write-Log ("--RestoreDialPriority：当前 IpPrioritizeRemote={0}，目标 1（拨号当默认网关）" -f $curVal)
+    if ($curVal -eq '1') {
+        Write-Log '已经是拨号优先，无需改动。' 'OK'
+    }
+    else {
+        if (-not (Set-ParkSetting -Value '1')) {
+            Write-Log '写回电话簿失败，未能恢复。' 'ERROR'
+            $mutex.ReleaseMutex(); $mutex.Dispose()
+            exit 1
+        }
+        # RAS 只在连接时读这个值，所以要重连一次才生效。
+        if (Test-DialConnected) {
+            if (Restart-Dialup) { Write-Log '已重连，拨号重新成为默认网关。' 'OK' }
+            else { Write-Log '电话簿已还原，但重连失败；下次连上后即生效。' 'WARN' }
+        }
+        else {
+            Write-Log '电话簿已还原；拨号连上后即成为默认网关。' 'OK'
+        }
+    }
+    Write-Status
+    $mutex.ReleaseMutex(); $mutex.Dispose()
+    exit 0
 }
 
 if (-not $wifiAdapter) {

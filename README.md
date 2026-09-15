@@ -68,11 +68,12 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -HighBand
 计划任务的动作参数是：
 
 ```text
--NoProfile -ExecutionPolicy Bypass -File "E:\campus-network-redial\Switch-NetworkPath.ps1" -KeepParkedOnExit
+-NoProfile -ExecutionPolicy Bypass -File "E:\campus-network-redial\Switch-NetworkPath.ps1"
 ```
 
-末尾的 `-KeepParkedOnExit` 是特意加的（和 `Switch-NetworkPath.bat` 一致）：管理器退出或被关掉后，电话簿保持停放，机器留在 Wi-Fi 上。
-想改成退出即还原拨号优先，把 `Set-AutoStart.ps1` 里的 `$managerTaskArgs` 末尾那段删掉、再重开一次自启即可。
+**不带** `-KeepParkedOnExit`（和 `Switch-NetworkPath.bat` 一致）：管理器退出时会把电话簿里的停放开关还原成 `1` 并重连，也就是让**拨号重新成为默认网关（拨号优先级最高）**。
+
+想让管理器退出后一直待在 Wi-Fi 上，就给这两处都加上 `-KeepParkedOnExit`（改 `Set-AutoStart.ps1` 里的 `$managerTaskArgs`，然后重开一次自启）。
 
 ### 常驻网络管理器：Wi-Fi 保底 + 拨号主用（推荐）
 
@@ -107,27 +108,31 @@ powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1 -Status
 
 > ### ⚠️ 退出后电话簿开关会怎样
 >
-> `Switch-NetworkPath.bat`（以及开机自启的计划任务）都是带 **`-KeepParkedOnExit`** 启动的，
-> 意思是：**管理器一停，电话簿里的停放开关就留在 `0`** —— 拨号仍然能连上，但不再抢默认路由，
-> 于是机器继续待在 Wi-Fi 上，不会自己跳回拨号出口，也不会因为"被硬杀"而漏掉还原动作。
+> `Switch-NetworkPath.bat`（以及开机自启的计划任务）**不带** `-KeepParkedOnExit`，
+> 所以**管理器正常退出时会把停放开关还原成 `1` 并重连 —— 拨号重新成为默认网关，也就是拨号优先级最高。**
 >
-> 代价是**这个开关不会自动还原了**，想回到"拨号优先"得手动做，见下面「怎么退出后回到拨号优先」。
+> 但要注意一个例外：**如果管理器是被"硬杀"的**（直接关窗口 / 任务管理器结束进程），`finally` 里的还原逻辑
+> **不会执行**，电话簿会留在停放态 `0`。此时拨号仍能连上但不抢默认路由，机器会一直待在 Wi-Fi 上。
+> 这种情况下用下面的一行命令恢复。
 
-### 怎么退出后回到拨号优先
+### 恢复成"拨号优先"
 
-停放开关是电话簿里的 `IpPrioritizeRemote`，`0` = 拨号不抢默认路由，`1` = 拨号当默认网关。恢复方式：
+停放开关是电话簿里的 `IpPrioritizeRemote`，`0` = 拨号不抢默认路由，`1` = 拨号当默认网关。
 
-1. 跑一次**不带** `-KeepParkedOnExit` 的管理器（它会先装停放开关、再在退出时还原成 `1` 并重连）：
-   ```powershell
-   powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1
-   ```
-   让它跑几秒，然后 `Ctrl+C` —— 退出时会自动把开关还原成 `1`。
-2. 想确认当前值，随时跑 `-Status`，第一段就是：
+**一行恢复（推荐）** —— 把开关写回 `1` 并重连，然后打印状态退出（会弹一次 UAC）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1 -RestoreDialPriority
+```
+
+想确认当前值，随时跑 `-Status`，第一段就是：
 
    ```text
    --- 电话簿（停放开关）---
      IpPrioritizeRemote = 0   （0 = 拨号不抢默认路由 / 停放态；1 = 拨号当默认网关）
    ```
+
+其它可选做法：跑一次管理器然后 `Ctrl+C`（退出时也会还原），或者在宽带连接属性里手动改回来。
 
 停放在 `0` 期间拨号**仍然可以正常拨上**（`rasdial` 能连、能拿到 IP），只是它不承载你的流量 —— 管理器就是靠这一点在后台验证新出口的。
 
@@ -239,7 +244,8 @@ IpPrioritizeRemote=0     ← "在远程网络上使用默认网关" 关掉
 | `-FailThreshold` | 1 | 连续几轮不健康才降级；默认 1 = 一轮不过就切回 Wi-Fi |
 | `-PauseSeconds` | 2 | 坏出口后重新拨号前的停顿 |
 | `-MaxDialBackoffSeconds` | 60 | 拨号失败时的退避上限 |
-| `-KeepParkedOnExit` | 关 | 退出时不还原电话簿开关（保持停放=一直待在 Wi-Fi）。`Switch-NetworkPath.bat` 和开机自启的计划任务都默认带上它 |
+| `-KeepParkedOnExit` | 关 | 退出时**不**还原电话簿开关（保持停放=一直待在 Wi-Fi）。`Switch-NetworkPath.bat` 和计划任务都**不带**它，所以默认是退出即恢复拨号优先 |
+| `-RestoreDialPriority` | — | 一次性恢复：把电话簿开关写回 `1`、重连、打印状态后退出（硬杀之后的恢复入口，免提权可跑但会自提权）|
 | `-LogPath` | `logs\network-path.log` | 日志路径 |
 | `-Status` | — | 只打印当前状态，不进循环（免提权可跑）|
 
@@ -248,7 +254,7 @@ IpPrioritizeRemote=0     ← "在远程网络上使用默认网关" 关掉
 - `C:\ProgramData\Microsoft\Network\Connections\Pbk\rasphone.pbk`：把 `[校园网-1]` 段的 `IpPrioritizeRemote` 改成 `0`。
   改之前会**自动备份**到 `logs\rasphone.pbk.bak`，写完会做完整性自检（段落头 / 关键行 / 换行符），
   自检不过立刻回滚 —— 因为把这个文件写坏会让 RAS 报 623「找不到电话簿项目」。
-- 退出时会改回 `1` 并重连（除非加 `-KeepParkedOnExit`）。
+- 退出时会改回 `1` 并重连，让拨号重新当默认网关（除非加 `-KeepParkedOnExit`）。被硬杀时不会还原，用 `-RestoreDialPriority` 恢复。
 
 ## 实测记录（2026-09-11）
 

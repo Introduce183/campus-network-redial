@@ -14,12 +14,10 @@ $redialPath = Join-Path $PSScriptRoot 'Redial-UntilCampusReady.ps1'
 $managerPath = Join-Path $PSScriptRoot 'Switch-NetworkPath.ps1'
 
 # 开机自启给管理器带的参数。
-# 带 -KeepParkedOnExit 的含义：管理器退出（含被直接关窗口/硬杀）之后，
-# 电话簿里的停放开关**保持 IpPrioritizeRemote=0**，也就是"拨号连着但不抢默认路由"，
-# 机器继续待在 Wi-Fi 上，不会自己跳回拨号出口。
-# 副作用：不带这个参数时管理器退出会还原成 1；带了这个参数就永不自动还原，
-# 想恢复见 README「怎么退出后回到拨号优先」。
-$managerTaskArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -KeepParkedOnExit'
+# 注意这里【不带】-KeepParkedOnExit：管理器退出时会把电话簿里的停放开关还原成
+# IpPrioritizeRemote=1 并重连，也就是让拨号重新当默认网关（拨号优先级最高）。
+# 想让退出后一直待在 Wi-Fi 上，才需要加 -KeepParkedOnExit。
+$managerTaskArgs = '-NoProfile -ExecutionPolicy Bypass -File "{0}"'
 
 # 必须在脚本作用域取好：函数内部的 $MyInvocation.MyCommand 是那个函数本身而不是脚本文件，
 # 取 .Path 在 StrictMode 下会直接抛 "在此对象上找不到属性 Path"。
