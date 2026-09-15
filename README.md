@@ -20,6 +20,60 @@
 
 ## 用法
 
+### 只检测当前出口（不拨号）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Test-CampusExit.ps1
+```
+
+### 自动重拨直到好出口
+
+最简单的方式：直接双击 `Redial-UntilCampusReady.bat`。它会先自动检测拨号上网电话簿里的宽带名称，再用检测到的名称运行主脚本。
+
+也可以手动在 PowerShell 里运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1
+```
+
+脚本会自动识别拨号连接名；识别不到时默认使用“宽带连接”。也可以手动指定：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName "校园网"
+```
+
+按 `Ctrl+C` 可随时停止。
+
+### 高速模式：重拨直到带宽达标
+
+如果只关心出口带宽，可以用 `-HighBandwidthMode`：脚本会重拨并测速，直到西电 LibreSpeed 下载测速超过 150 Mbps 才停下。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -HighBandwidthMode
+```
+
+该模式与 `-TestOnly` 互斥，不能同时使用。
+
+### 设置开机自启
+
+双击 `Set-AutoStart.bat`（会弹一次 UAC）。菜单里两个自启条目互相独立，可以分别开关：
+
+- 自动重拨脚本（前台窗口，拿到好出口后停下）—— 走 HKCU Run 键
+- 网络管理器（登录后后台常驻，无窗口）—— 走**最高权限计划任务**
+
+两者不要同时开，它们会互相抢 `rasdial`。建议只开网络管理器。
+
+管理器之所以用计划任务而不是 Run 键：它必须提权才能改电话簿和路由，而 Run 键没法让进程提权，用 Run 键启会每次登录弹一次 UAC。
+
+计划任务的动作参数是：
+
+```text
+-NoProfile -ExecutionPolicy Bypass -File "E:\campus-network-redial\Switch-NetworkPath.ps1" -KeepParkedOnExit
+```
+
+末尾的 `-KeepParkedOnExit` 是特意加的（和 `Switch-NetworkPath.bat` 一致）：管理器退出或被关掉后，电话簿保持停放，机器留在 Wi-Fi 上。
+想改成退出即还原拨号优先，把 `Set-AutoStart.ps1` 里的 `$managerTaskArgs` 末尾那段删掉、再重开一次自启即可。
+
 ### 常驻网络管理器：Wi-Fi 保底 + 拨号主用（推荐）
 
 > ### ⚠️ 启用前必读
@@ -76,60 +130,6 @@ powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1 -Status
    ```
 
 停放在 `0` 期间拨号**仍然可以正常拨上**（`rasdial` 能连、能拿到 IP），只是它不承载你的流量 —— 管理器就是靠这一点在后台验证新出口的。
-
-### 只检测当前出口（不拨号）
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Test-CampusExit.ps1
-```
-
-### 自动重拨直到好出口
-
-最简单的方式：直接双击 `Redial-UntilCampusReady.bat`。它会先自动检测拨号上网电话簿里的宽带名称，再用检测到的名称运行主脚本。
-
-也可以手动在 PowerShell 里运行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1
-```
-
-脚本会自动识别拨号连接名；识别不到时默认使用“宽带连接”。也可以手动指定：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -DialName "校园网"
-```
-
-按 `Ctrl+C` 可随时停止。
-
-### 高速模式：重拨直到带宽达标
-
-如果只关心出口带宽，可以用 `-HighBandwidthMode`：脚本会重拨并测速，直到西电 LibreSpeed 下载测速超过 150 Mbps 才停下。
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -HighBandwidthMode
-```
-
-该模式与 `-TestOnly` 互斥，不能同时使用。
-
-### 设置开机自启
-
-双击 `Set-AutoStart.bat`（会弹一次 UAC）。菜单里两个自启条目互相独立，可以分别开关：
-
-- 自动重拨脚本（前台窗口，拿到好出口后停下）—— 走 HKCU Run 键
-- 网络管理器（登录后后台常驻，无窗口）—— 走**最高权限计划任务**
-
-两者不要同时开，它们会互相抢 `rasdial`。建议只开网络管理器。
-
-管理器之所以用计划任务而不是 Run 键：它必须提权才能改电话簿和路由，而 Run 键没法让进程提权，用 Run 键启会每次登录弹一次 UAC。
-
-计划任务的动作参数是：
-
-```text
--NoProfile -ExecutionPolicy Bypass -File "E:\campus-network-redial\Switch-NetworkPath.ps1" -KeepParkedOnExit
-```
-
-末尾的 `-KeepParkedOnExit` 是特意加的（和 `Switch-NetworkPath.bat` 一致）：管理器退出或被关掉后，电话簿保持停放，机器留在 Wi-Fi 上。
-想改成退出即还原拨号优先，把 `Set-AutoStart.ps1` 里的 `$managerTaskArgs` 末尾那段删掉、再重开一次自启即可。
 
 ## 判定逻辑
 
