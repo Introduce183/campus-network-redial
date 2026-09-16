@@ -71,7 +71,15 @@ foreach ($s in $scripts) {
 
 Write-Output ''
 Write-Output '=== 编译 ==='
-if (Test-Path -LiteralPath $OutPath) { Remove-Item -LiteralPath $OutPath -Force }
+if (Test-Path -LiteralPath $OutPath) {
+    try {
+        Remove-Item -LiteralPath $OutPath -Force -ErrorAction Stop
+    }
+    catch {
+        # 常见原因就是"exe 正在运行"：Windows 不让覆盖正在执行的 exe。
+        throw ("删不掉旧的 {0} —— 多半是 CampusNetwork.exe 正在运行（或被杀软锁着）。先关掉它再重编。原始错误：{1}" -f $OutPath, $_.Exception.Message)
+    }
+}
 
 $cscArgs = @(
     '/nologo'
