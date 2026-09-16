@@ -316,8 +316,14 @@ function Test-WifiAlive {
     $route = Get-NetRoute -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $route -or $route.NextHop -eq '0.0.0.0') { return $false }
 
-    & ping.exe -n 1 -w 1000 $route.NextHop > $null 2>&1
-    return ($LASTEXITCODE -eq 0)
+    # 给两次机会再判死：这是"敢不敢把拨号停放"的硬闸，而单包 ping 太脆 ——
+    # 丢一个包就把 Wi-Fi 判成不可用，用户看到的就是"明明连着热点却开不了游戏模式"。
+    # 真断的网关两次都过不了，所以放宽到两次不会让这个闸失去意义。
+    foreach ($attempt in 1..2) {
+        & ping.exe -n 1 -w 1000 $route.NextHop > $null 2>&1
+        if ($LASTEXITCODE -eq 0) { return $true }
+    }
+    return $false
 }
 
 function Connect-Dialup {

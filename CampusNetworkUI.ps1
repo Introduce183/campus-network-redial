@@ -58,6 +58,36 @@ if (-not (Test-Path -LiteralPath $script:LogDir)) {
 # （本机 = 936/GBK）。所以凡是读子进程输出的地方都显式用这个编码，不靠默认值。
 $script:ChildEncoding = [Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage)
 
+function Write-UiError {
+    # WinForms 会把事件处理器里的异常吞掉（或弹一个模态框），界面看着还在、其实那一步没生效。
+    # 所以凡是可能抛的地方都往 logs\ui-error.log 留一条 —— 不然只能靠猜。
+    param([string]$Where, $Err)
+    $msg = ''
+    $stack = ''
+    try {
+        if ($Err -is [System.Management.Automation.ErrorRecord]) {
+            $msg = $Err.Exception.Message
+            $stack = [string]$Err.ScriptStackTrace
+        }
+        elseif ($Err -is [Exception]) { $msg = $Err.Message; $stack = [string]$Err.StackTrace }
+        else { $msg = [string]$Err }
+    }
+    catch { $msg = '(取异常信息都失败了)' }
+    try {
+        [IO.File]::AppendAllText((Join-Path $script:LogDir 'ui-error.log'),
+            ('{0} [{1}] {2}{3}{4}{3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Where, $msg, [Environment]::NewLine, $stack),
+            [Text.UTF8Encoding]::new($false))
+    }
+    catch { }
+}
+
+# 定时器/按钮回调里的异常默认会弹模态框并顶掉窗口标题，捕获模式改成自己处理 + 落盘。
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($sender, $e)
+    Write-UiError -Where 'ThreadException' -Err $e.Exception
+})
+
 # ---------------------------------------------------------------- 通用
 
 function Invoke-Hidden {
@@ -436,9 +466,33 @@ $btnBoth.Location = New-Object System.Drawing.Point(176, 664)
 $btnBoth.Size = New-Object System.Drawing.Size(150, 30)
 $form.Controls.Add($btnBoth)
 
+# 一个按钮干两件事：拨号连着就断开、断开就拨上（标签跟着状态变）。
+# 断开不碰电话簿开关 —— 下次拨上来照样是"拨号优先"。
+$btnDial = New-Object System.Windows.Forms.Button
+$btnDial.Text = '断开拨号'
+$btnDial.Location = New-Object System.Drawing.Point(336, 664)
+$btnDial.Size = New-Object System.Drawing.Size(188, 30)
+$form.Controls.Add($btnDial)
+
 function Add-LogLine {
     param([string]$Text)
-    $txtOutput.AppendText(('[{0}] {1}{2}' -f (Get-Date -Format 'HH:mm:ss'), $Text, [Environment]::NewLine))
+    # **先落盘再写界面**：界面那半句万一抛（控件状态异常之类），日志不该跟着一起丢。
+    try {
+        $logFile = Join-Path $script:LogDir 'ui.log'
+        # 注意别写成 `if (Test-Path X -and (Get-Item X).Length ...)`：
+        # -and 会被当成 Test-Path 的参数，后面的 Get-Item **无条件求值**、短路失效，
+        # 文件不存在时直接抛 ItemNotFoundException —— 实测踩过，整句日志都会没。
+        if (Test-Path -LiteralPath $logFile) {
+            if ((Get-Item -LiteralPath $logFile).Length -gt 256KB) {
+                Move-Item -LiteralPath $logFile -Destination (Join-Path $script:LogDir 'ui.log.1') -Force
+            }
+        }
+        [IO.File]::AppendAllText($logFile,
+            ('{0} {1}{2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text, [Environment]::NewLine),
+            [Text.UTF8Encoding]::new($false))
+    }
+    catch { }
+    try { $txtOutput.AppendText(('[{0}] {1}{2}' -f (Get-Date -Format 'HH:mm:ss'), $Text, [Environment]::NewLine)) } catch { }
 }
 
 # ---------------------------------------------------------------- 刷新
@@ -542,6 +596,10 @@ function Update-UiStates {
             $lblGameHint.Text = '只保证一直都有可用网络，可能会在校园网与热点之间切换，不保证游戏时的稳定性。'
             $lblGameHint.ForeColor = [System.Drawing.Color]::DimGray
         }
+
+        # ---- 拨号开关按钮：跑着模式时别去跟它们抢拨号
+        $btnDial.Enabled = (-not $redialRunning) -and (-not $gameRunning)
+        $btnDial.Text = if ($S -and $S.dialConnected) { '断开拨号' } else { '拨号' }
     }
     finally { $script:SuppressEvents = $false }
 }
@@ -556,22 +614,25 @@ function Update-AutoStartSwitch {
 }
 
 function Update-Status {
-    # 定时调用：优先只读 status.json（零进程开销）。需要实时值时才用 -Fresh。
+    # 定时调用。要点：**管理器没在跑的时候不能信 logs\status.json** ——
+    # 那是上一次运行留下的快照，可能过期很久（实测碰到过面板显示一天前的状态，
+    # 表现就是"明明连着 Wi-Fi 却开不了游戏模式"）。没在跑就自己实时查，但别每秒起进程：最多 8 秒一次。
     param([switch]$Fresh)
 
-    $s = Get-StatusObject -Fresh:$Fresh
-    if (-not $s -and -not $Fresh) {
-        # 还没有状态文件（管理器没跑过）。这里**不能**每秒都真查一次，
-        # 否则界面开着就每秒起一个 powershell —— 最多 10 秒查一次。
-        if ($script:FreshStatusDue -le (Get-Date)) {
-            $script:FreshStatusDue = (Get-Date).AddSeconds(10)
-            $s = Get-StatusObject -Fresh
-        }
+    $s = $null
+    if (Test-ManagerRunning) {
+        # 管理器在跑：status.json 每轮都在重写，读文件最省。
+        $s = Get-StatusObject
+    }
+    elseif ($Fresh -or $script:FreshStatusDue -le (Get-Date)) {
+        $script:FreshStatusDue = (Get-Date).AddSeconds(8)
+        $s = Get-StatusObject -Fresh
     }
 
+    if (-not $s) { $s = $script:LastStatus }   # 这次没查到就先用上一次的
     if (-not $s) {
-        $lblStatus.Text = '还没有实时数据：管理器没在跑时，这里每 10 秒真查一次（刚点过「重新检测」也是）。'
-        Update-UiStates -S $script:LastStatus
+        $lblStatus.Text = '正在读取状态…（管理器没在跑时每 8 秒实时查一次）'
+        Update-UiStates -S $null
         return $null
     }
     $script:LastStatus = $s
@@ -621,12 +682,21 @@ $btnGameToggle.Add_Click({
         switch ($r) {
             'started' { Add-LogLine '游戏模式已开启（管理器在后台运行；它会自己请求提权）。' }
             'no-wifi' {
-                Add-LogLine '开不了：Wi-Fi（热点）当前不可用 —— 请先连上热点。'
+                # 别咬定"热点没连" —— 可能是 Wi-Fi 网卡/路由有、只是这一次网关 ping 不通。
+                # 把当下的事实一起打出来，免得用户对着"请先连热点"发呆。
+                $d = $script:LastStatus
+                $detail = if ($d) {
+                    ('Wi-Fi「{0}」状态 {1}、IP {2}；网关探测没通过（每 8 秒会自动重查）' -f $d.wifiName, $d.wifiStatus, $d.wifiIp)
+                }
+                else { '读不到 Wi-Fi 状态' }
+                Add-LogLine ('开不了游戏模式：判定 Wi-Fi（热点）当前不可用 —— {0}' -f $detail)
                 [System.Windows.Forms.MessageBox]::Show(
-                    ('请先连上热点（Wi-Fi）。' + [Environment]::NewLine + [Environment]::NewLine +
-                     '游戏模式的做法是"把拨号停放到 Wi-Fi 旁边、流量跑在 Wi-Fi 上、拨号只做后台候选"。' + [Environment]::NewLine +
-                     '热点没连上时，停放等于把流量丢进黑洞（拨号让出了默认路由，而 Wi-Fi 给不出路由）。'),
-                    '需要先连上热点', 'OK', 'Warning') | Out-Null
+                    ('游戏模式需要 Wi-Fi（热点）可用。' + [Environment]::NewLine + [Environment]::NewLine +
+                     '它靠"把拨号停放到 Wi-Fi 旁边、流量跑在 Wi-Fi 上、拨号只做后台候选"工作；' + [Environment]::NewLine +
+                     '没有 Wi-Fi 时停放等于把流量丢进黑洞（拨号让出了默认路由，而 Wi-Fi 给不出路由）。' + [Environment]::NewLine + [Environment]::NewLine +
+                     ('当前：' + $detail) + [Environment]::NewLine + [Environment]::NewLine +
+                     '如果热点明明是连着的，点一下「重新检测」再看；还不行就看下面日志区/ logs\ui.log。'),
+                    'Wi-Fi（热点）当前不可用', 'OK', 'Warning') | Out-Null
             }
         }
     }
@@ -666,6 +736,28 @@ $btnBoth.Add_Click({
     Update-Status -Fresh | Out-Null
 })
 
+$btnDial.Add_Click({
+    $st = Get-StatusObject -Fresh
+    if ($st) { $script:LastStatus = $st }
+    elseif ($script:LastStatus) { $st = $script:LastStatus }
+    if (-not $st -or -not $st.dialName) {
+        Add-LogLine '拿不到拨号连接名，先点一下「重新检测」。'
+        return
+    }
+
+    if (-not $st.dialConnected) {
+        Add-LogLine ('拨号（{0}）现在是断开的，正在拨上…' -f $st.dialName)
+        & rasdial.exe $st.dialName | Out-Null
+        Add-LogLine ('  结果：rasdial 退出码 {0}。连上后拨号重新成为默认网关（电话簿开关 = {1}）。' -f $LASTEXITCODE, $st.parkSwitch)
+    }
+    else {
+        Add-LogLine ('正在断开拨号（{0}）…' -f $st.dialName)
+        & rasdial.exe $st.dialName /disconnect | Out-Null
+        Add-LogLine ('  结果：rasdial 退出码 {0}。流量现在走 Wi-Fi；电话簿开关不变（{1}），所以下次拨上来仍是拨号优先。' -f $LASTEXITCODE, $st.parkSwitch)
+    }
+    Update-Status -Fresh | Out-Null
+})
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.Add_Tick({
@@ -675,12 +767,15 @@ $timer.Add_Tick({
 $timer.Start()
 
 $form.Add_Shown({
-    $s = Update-Status -Fresh
-    Update-AutoStartSwitch
-    Add-LogLine '界面已就绪。'
-    if ($s -and -not $s.wifiAlive) {
-        Add-LogLine '提示：Wi-Fi（热点）当前不可用 —— 游戏模式暂时开不了，重拨模式和其它按钮照常可用。'
+    try {
+        $s = Update-Status -Fresh
+        Update-AutoStartSwitch
+        Add-LogLine '界面已就绪。'
+        if ($s -and -not $s.wifiAlive) {
+            Add-LogLine '提示：Wi-Fi（热点）当前不可用 —— 游戏模式暂时开不了，重拨模式和其它按钮照常可用。'
+        }
     }
+    catch { Write-UiError -Where 'Add_Shown' -Err $_ }
 })
 
 $form.Add_FormClosing({
