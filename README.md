@@ -8,6 +8,35 @@
 
 `Switch-NetworkPath.ps1` 则在同一套探针之上做**常驻主备管理**：拨号作主用、Wi-Fi 作保底，两者自动切换，保证任何时候都至少有一条可用出口。**找出口的整个过程你都在 Wi-Fi 上，只有确认可用的出口才会被提为主用。**
 
+## 图形界面：一个 exe 搞定（主推用法）
+
+不想记命令行就用 `CampusNetwork.exe` —— 后面那些工具都在一个窗口里。编译好的在 [Releases](https://github.com/Introduce183/campus-network-redial/releases/latest)，也可以自己用 `build.ps1` 编。双击它**只弹一次 UAC**（exe 清单要求管理员，之后 GUI、引擎、计划任务注册都在这个提权上下文里跑）。
+
+窗口分三块：**实时状态**、**两个模式**（标签页）、**日志 + 两个共用按钮**。
+
+**两个模式（互斥 —— 都要动拨号，同时开会互抢 `rasdial`，所以一个在跑另一个就置灰）**
+
+| 模式 | 背后 | 说明 |
+| --- | --- | --- |
+| **正常重拨模式** | `Redial-UntilCampusReady.ps1` | 一直换出口直到确认好出口。运行方式三选一：**普通重拨** / **只测当前出口**（`-TestOnly`，不拨号，当体检用）/ **高速模式**（`-HighBandwidthMode`，重拨到西电测速超 150 Mbps）。输出**实时**进日志区，完整输出另存 `logs\redial-*.out.txt` |
+| **游戏模式** | `Switch-NetworkPath.ps1`（常驻管理器） | 停放 → 确认好出口转主用 → 变坏立刻退回 Wi-Fi。硬前提是**先连上热点**，没连上按钮置灰并提示；面板上还有它自己的**开机自启** |
+
+共用按钮：**恢复拨号优先**（等价 `-RestoreDialPriority`）、**测一轮双出口**（两个出口各测一次 + 出口源地址确认，追加到 `logs\exit-compare.log`）。
+
+状态面板每秒读一次 `logs\status.json`（纯文件读，不会一直起新进程）：当前承载、健康已持续多久、电话簿开关、**拨号是否真的握着默认路由**、Wi-Fi 保底是否可用。
+
+两个刻意的设计：**停管理器是写一个 `logs\stop.req` 让它优雅退出**（直接杀进程会跳过还原逻辑，电话簿会留在停放态）；**关窗口不会停任何模式**（要停就点按钮）。
+
+### exe 的来路（改了脚本必须重编）
+
+`build.ps1` 用 Windows 自带的 `csc.exe` 编译 `host.cs`，脚本作为**内嵌资源**打进同一个 exe：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1     # 产出 CampusNetwork.exe
+```
+
+启动时把脚本解到 `%LOCALAPPDATA%\CampusNetworkRedial\scripts`：**每次启动按内容哈希核对**，对不上就重写，解出来的文件设为只读。日志（含 `redial-*.out.txt`）也在那个目录下，**不是**仓库里的 `logs\`。想单独导出一份副本看/改：`CampusNetwork.exe -ExtractScripts D:\临时目录`。
+
 ## 检测原理
 
 用一个在线服务作为探针：好出口能快速连通它的接口，坏出口则会被限速到请求超时。当前探针使用斗鱼直播的接口。
@@ -75,36 +104,7 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -HighBand
 
 想让管理器退出后一直待在 Wi-Fi 上，就给这两处都加上 `-KeepParkedOnExit`（改 `Set-AutoStart.ps1` 里的 `$managerTaskArgs`，然后重开一次自启）。
 
-### 图形界面 + 单文件 exe（推荐）
-
-不想记命令行就用 `CampusNetwork.exe` —— 上面那些工具都在一个窗口里。双击它**只弹一次 UAC**（exe 清单要求管理员，之后 GUI、引擎、计划任务注册都在这个提权上下文里跑）。
-
-窗口分三块：**实时状态**、**两个模式**（标签页）、**日志 + 两个共用按钮**。
-
-**两个模式（互斥 —— 都要动拨号，同时开会互抢 `rasdial`，所以一个在跑另一个就置灰）**
-
-| 模式 | 背后 | 说明 |
-| --- | --- | --- |
-| **正常重拨模式** | `Redial-UntilCampusReady.ps1` | 一直换出口直到确认好出口。运行方式三选一：**普通重拨** / **只测当前出口**（`-TestOnly`，不拨号，当体检用）/ **高速模式**（`-HighBandwidthMode`，重拨到西电测速超 150 Mbps）。输出**实时**进日志区，完整输出另存 `logs\redial-*.out.txt` |
-| **游戏模式** | `Switch-NetworkPath.ps1`（常驻管理器） | 停放 → 确认好出口转主用 → 变坏立刻退回 Wi-Fi。硬前提是**先连上热点**，没连上按钮置灰并提示；面板上还有它自己的**开机自启** |
-
-共用按钮：**恢复拨号优先**（等价 `-RestoreDialPriority`）、**测一轮双出口**（两个出口各测一次 + 出口源地址确认，追加到 `logs\exit-compare.log`）。
-
-状态面板每秒读一次 `logs\status.json`（纯文件读，不会一直起新进程）：当前承载、健康已持续多久、电话簿开关、**拨号是否真的握着默认路由**、Wi-Fi 保底是否可用。
-
-两个刻意的设计：**停管理器是写一个 `logs\stop.req` 让它优雅退出**（直接杀进程会跳过还原逻辑，电话簿会留在停放态）；**关窗口不会停任何模式**（要停就点按钮）。
-
-#### exe 的来路（改了脚本必须重编）
-
-`build.ps1` 用 Windows 自带的 `csc.exe` 编译 `host.cs`，脚本作为**内嵌资源**打进同一个 exe：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1     # 产出 CampusNetwork.exe
-```
-
-启动时把脚本解到 `%LOCALAPPDATA%\CampusNetworkRedial\scripts`：**每次启动按内容哈希核对**，对不上就重写，解出来的文件设为只读。日志（含 `redial-*.out.txt`）也在那个目录下，**不是**仓库里的 `logs\`。想单独导出一份副本看/改：`CampusNetwork.exe -ExtractScripts D:\临时目录`。
-
-### 常驻网络管理器：Wi-Fi 保底 + 拨号主用（推荐）
+### 常驻网络管理器：Wi-Fi 保底 + 拨号主用
 
 > ### ⚠️ 启用前必读
 >
@@ -115,7 +115,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1     # 产出 CampusNetwork.
 >
 > **2. 此脚本只保证一直都有可用网络，可能会在校园网与热点之间切换，不保证游戏时的稳定性。**
 
-> 图形界面（上一节）里这个开关叫 **游戏模式** —— 同一件事，换了名字。
+> 图形界面里那个 **游戏模式** 就是这件事 —— 同一套逻辑，换了个名字（见最前面那节）。
 
 双击 `Switch-NetworkPath.bat`（会弹一次 UAC）。它会常驻运行：
 
