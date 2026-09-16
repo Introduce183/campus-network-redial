@@ -77,70 +77,32 @@ powershell -ExecutionPolicy Bypass -File .\Redial-UntilCampusReady.ps1 -HighBand
 
 ### 图形界面 + 单文件 exe（推荐）
 
-不想记命令行的话，用 `CampusNetwork.exe` —— 上面这些工具都在一个窗口里：
+不想记命令行就用 `CampusNetwork.exe` —— 上面那些工具都在一个窗口里。双击它**只弹一次 UAC**（exe 清单要求管理员，之后 GUI、引擎、计划任务注册都在这个提权上下文里跑）。
 
-```text
-双击 CampusNetwork.exe  →  只弹一次 UAC  →  窗口里选模式、点开关
-```
+窗口分三块：**实时状态**、**两个模式**（标签页）、**日志 + 两个共用按钮**。
 
-界面分三块：**实时状态**、**两个模式**（标签页）、**日志 + 两个共用按钮**。
+**两个模式（互斥 —— 都要动拨号，同时开会互抢 `rasdial`，所以一个在跑另一个就置灰）**
 
-#### 两个模式（互斥，只能开一个）
-
-两个模式都要动拨号，同时开会互相抢 `rasdial`，所以界面里做了互斥：一个在跑，另一个就置灰并说明原因。
-
-| 模式 | 背后是谁 | 干什么 |
+| 模式 | 背后 | 说明 |
 | --- | --- | --- |
-| **正常重拨模式** | `Redial-UntilCampusReady.ps1` | 重新拨号，直到三轮探测确认拿到好出口。运行方式三选一（见下）。输出**实时**显示在日志区，完整输出另存 `logs\redial-*.out.txt` |
-| **游戏模式** | `Switch-NetworkPath.ps1`（常驻管理器） | 把拨号停放到 Wi-Fi 旁边 → 确认好出口后提为主用 → 出口变坏立刻退回 Wi-Fi。硬前提是**先连上热点**，没连上时按钮置灰并给出提示 |
+| **正常重拨模式** | `Redial-UntilCampusReady.ps1` | 一直换出口直到确认好出口。运行方式三选一：**普通重拨** / **只测当前出口**（`-TestOnly`，不拨号，当体检用）/ **高速模式**（`-HighBandwidthMode`，重拨到西电测速超 150 Mbps）。输出**实时**进日志区，完整输出另存 `logs\redial-*.out.txt` |
+| **游戏模式** | `Switch-NetworkPath.ps1`（常驻管理器） | 停放 → 确认好出口转主用 → 变坏立刻退回 Wi-Fi。硬前提是**先连上热点**，没连上按钮置灰并提示；面板上还有它自己的**开机自启** |
 
-**正常重拨模式的运行方式**（三选一，和脚本自己的开关一一对应）：
+共用按钮：**恢复拨号优先**（等价 `-RestoreDialPriority`）、**测一轮双出口**（两个出口各测一次 + 出口源地址确认，追加到 `logs\exit-compare.log`）。
 
-| 运行方式 | 对应 | 说明 |
-| --- | --- | --- |
-| 普通重拨（默认） | 无参数 | 一直换出口，直到拿到好出口（三轮确认全通过）|
-| 只测当前出口 | `-TestOnly` | 不拨号，只判断现在这条出口好不好 —— 适合"现在这条能用吗"的体检 |
-| 高速模式 | `-HighBandwidthMode` | 一直重拨，直到西电测速超过 **150 Mbps** |
+状态面板每秒读一次 `logs\status.json`（纯文件读，不会一直起新进程）：当前承载、健康已持续多久、电话簿开关、**拨号是否真的握着默认路由**、Wi-Fi 保底是否可用。
 
-**游戏模式面板**上只有一个「开启/关闭」按钮、一个**开机自启**勾选框（登录后自动开游戏模式，走最高权限计划任务），
-以及上面那句稳定性说明。底层参数都保持默认 —— 那些值是实机调出来的，不在界面上随手改。
+两个刻意的设计：**停管理器是写一个 `logs\stop.req` 让它优雅退出**（直接杀进程会跳过还原逻辑，电话簿会留在停放态）；**关窗口不会停任何模式**（要停就点按钮）。
 
-#### 共用的两个按钮
+#### exe 的来路（改了脚本必须重编）
 
-| 按钮 | 作用 |
-| --- | --- |
-| **恢复拨号优先** | 管理器被硬杀之后把电话簿开关写回 `1` 并重连（等价 `-RestoreDialPriority`）|
-| **测一轮双出口** | 拨号出口和 Wi-Fi 出口各测一次并做出口源地址确认，结果同时追加到 `logs\exit-compare.log` |
-
-上半部分的实时状态：当前承载、健康已持续多久、电话簿开关、**拨号是否真的握着默认路由**、Wi-Fi 保底是否可用。
-它是每 1 秒读一次 `logs\status.json`（纯文件读，不会一直起新进程）。
-
-三个刻意的设计：
-
-- **停管理器走"优雅退出"**（写一个 `logs\stop.req` 让它自己退），不是直接杀进程 —— 直接杀会让它的退出还原逻辑不执行，电话簿会留在停放态、晋升那条路由也会留下。
-- **停重拨模式才是真杀进程**（它没有需要收尾的资源），但杀完会检查拨号是否还连着，如果被留在断开状态就补拨一次。
-- **关窗口不会停任何模式**（要停就点按钮），免得手滑关掉界面就丢了保底。
-
-#### exe 是怎么来的、怎么重新编译
-
-`CampusNetwork.exe` 由 `build.ps1` 用 Windows 自带的 `csc.exe` 编译，脚本作为**内嵌资源**打进同一个 exe：
+`build.ps1` 用 Windows 自带的 `csc.exe` 编译 `host.cs`，脚本作为**内嵌资源**打进同一个 exe：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
+powershell -ExecutionPolicy Bypass -File .\build.ps1     # 产出 CampusNetwork.exe
 ```
 
-（本机没有 .NET SDK、没有 PS2EXE、没有 NSIS，in-box 的 `csc.exe` 是唯一能完全离线出 exe 的路子。）
-
-exe 启动时会把脚本解到 `%LOCALAPPDATA%\CampusNetworkRedial\scripts`，然后跑 `CampusNetworkUI.ps1`。
-**每次启动都按内容哈希核对**，对不上就重写；解出来的文件设为**只读**。所以：**改了脚本必须重新编译**，否则 exe 里还是旧的。
-
-想手动看那份解出来的副本（也方便你改来调试）：
-
-```powershell
-CampusNetwork.exe -ExtractScripts D:\临时目录
-```
-
-用 exe 跑的时候，运行日志和 `redial-*.out.txt` 都在 `%LOCALAPPDATA%\CampusNetworkRedial\scripts\logs\`，**不是**仓库里的 `logs\`。
+启动时把脚本解到 `%LOCALAPPDATA%\CampusNetworkRedial\scripts`：**每次启动按内容哈希核对**，对不上就重写，解出来的文件设为只读。日志（含 `redial-*.out.txt`）也在那个目录下，**不是**仓库里的 `logs\`。想单独导出一份副本看/改：`CampusNetwork.exe -ExtractScripts D:\临时目录`。
 
 ### 常驻网络管理器：Wi-Fi 保底 + 拨号主用（推荐）
 
@@ -179,6 +141,7 @@ powershell -ExecutionPolicy Bypass -File .\Switch-NetworkPath.ps1 -Status
 >
 > `Switch-NetworkPath.bat`（以及开机自启的计划任务）**不带** `-KeepParkedOnExit`，
 > 所以**管理器正常退出时会把停放开关还原成 `1` 并重连 —— 拨号重新成为默认网关，也就是拨号优先级最高。**
+> （退出时如果拨号正好断在"换出口"的中间，会补拨一次；上一次晋升留下的那条默认路由也会被清掉。）
 >
 > 但要注意一个例外：**如果管理器是被"硬杀"的**（直接关窗口 / 任务管理器结束进程），`finally` 里的还原逻辑
 > **不会执行**，电话簿会留在停放态 `0`。此时拨号仍能连上但不抢默认路由，机器会一直待在 Wi-Fi 上。
