@@ -215,6 +215,8 @@ function Start-Redial {
     $script:RedialAllText = ''
     $script:TailOffsets = @{}
     $script:RedialDone = $false
+    $script:RedialStartedAt = Get-Date   # 「已持续」从这里起算
+    $script:RedialAttempts = 0           # 「已尝试 N 次」每个 run 从 0 起
 
     $argl = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $script:RedialPath) + (Get-RedialArgs)
     $script:RedialArgText = if ((Get-RedialArgs).Count) { (Get-RedialArgs) -join ' ' } else { '（默认：重拨到好出口）' }
@@ -292,7 +294,15 @@ function Append-NewOutput {
     if ($text.Length -eq $off) { return }
     $new = $text.Substring($off)
     $script:TailOffsets[$Tag] = $text.Length
-    if ($Tag -eq '重拨') { $script:RedialAllText += $new }
+    if ($Tag -eq '重拨') {
+        $script:RedialAllText += $new
+        # 重拨脚本每换一个出口就会打一行 "Attempt N"（高速模式是"第 N 次连接尝试"）——
+        # 把最大的那个数抓到，界面就能显示"已尝试 N 次"，没成功时它只会往上加。
+        foreach ($m in [regex]::Matches($new, 'Attempt\s+(\d+)|第\s*(\d+)\s*次连接尝试')) {
+            $v = if ($m.Groups[1].Success) { [int]$m.Groups[1].Value } else { [int]$m.Groups[2].Value }
+            if ($v -gt $script:RedialAttempts) { $script:RedialAttempts = $v }
+        }
+    }
     foreach ($line in ($new -split "`r?`n")) {
         $t = $line.TrimEnd()
         if ($t) { Add-LogLine ('[{0}] {1}' -f $Tag, $t) }
@@ -507,6 +517,21 @@ $script:TailOffsets = @{}
 $script:LastStatus = $null
 $script:FreshStatusDue = [datetime]::MinValue
 $script:CarrierEvidence = ''   # 「重新检测」时做一次行为确认（curl 看源地址），显示在状态面板最后一行
+$script:RedialStartedAt = $null         # 重拨模式这一轮的起点（用来算"已持续"）
+$script:RedialAttempts = 0              # 从重拨脚本输出里抓到的"第几次尝试"
+$script:EngineRunningForStatus = $false # 面板上的时长只在引擎真的在跑时外推，否则会一直往上飘
+
+function Format-Elapsed {
+    # 和引擎控制台那行一个口径：X 分 Y 秒 / X 小时 Y 分 Y 秒
+    param([int]$Seconds)
+    if ($Seconds -lt 0) { $Seconds = 0 }
+    $h = [int][Math]::Floor($Seconds / 3600)
+    $m = [int][Math]::Floor(($Seconds % 3600) / 60)
+    $s = $Seconds % 60
+    if ($h -gt 0) { return ('{0} 小时 {1} 分 {2} 秒' -f $h, $m, $s) }
+    if ($m -gt 0) { return ('{0} 分 {1} 秒' -f $m, $s) }
+    return ('{0} 秒' -f $s)
+}
 
 function Format-StatusText {
     param([pscustomobject]$S)
@@ -535,10 +560,19 @@ function Format-StatusText {
     else { '1（拨号一连上就是默认网关）' }
     # 这一对刻意分开显示：电话簿说"停放"、而拨号仍握着默认路由，就是引擎在主用。
     $holdsText = if ($S.dialHoldsDefault) { '是' } else { '否' }
-    $healthyText = if ($S.healthySeconds -gt 0) {
-        '{0} 分 {1} 秒' -f [int]([Math]::Floor($S.healthySeconds / 60)), ($S.healthySeconds % 60)
+    # 「健康已持续」要每秒都在走：引擎每轮才重写一次状态，所以这里按状态里的时间戳本地外推。
+    # 只在引擎确实在跑时外推（否则引擎一停这个数会一直往上飘），并且最多补 20 秒。
+    $healthSecs = 0
+    if ($S.healthySeconds) { $healthSecs = [int]$S.healthySeconds }
+    if ($healthSecs -gt 0 -and $script:EngineRunningForStatus) {
+        try {
+            $takenAt = [datetime]::ParseExact([string]$S.time, 'yyyy-MM-dd HH:mm:ss', $null)
+            $delta = ((Get-Date) - $takenAt).TotalSeconds
+            if ($delta -gt 0) { $healthSecs += [int][Math]::Floor([Math]::Min($delta, 20)) }
+        }
+        catch { }
     }
-    else { '—' }
+    $healthyText = if ($healthSecs -gt 0) { Format-Elapsed -Seconds $healthSecs } else { '—' }
 
     $lines = @(
         ('当前承载   ：{0}' -f $carrierText)
@@ -546,6 +580,7 @@ function Format-StatusText {
         ('健康已持续 ：{0}' -f $healthyText)
         ('最近检查   ：{0}' -f $(if ($S.lastCheck) { $S.lastCheck } else { '—' }))
         ('拨号       ：{0}' -f $dialText)
+        ('拨号尝试   ：本会话第 {0} 次{1}' -f [int]$S.dialAttempts, $(if ([int]$S.dialFailStreak -gt 0) { ('（当前连续失败 {0} 次）' -f [int]$S.dialFailStreak) } else { '' }))
         ('电话簿开关 ：{0}' -f $parkText)
         ('拨号握默认 ：{0}' -f $holdsText)
         ('Wi-Fi      ：{0} {1} {2}   保底可用：{3}' -f $S.wifiName, $S.wifiStatus, $S.wifiIp, $(if ($S.wifiAlive) { '是' } else { '否' }))
@@ -589,7 +624,12 @@ function Update-UiStates {
         $script:RadioHighBandwidth.Enabled = -not $redialRunning
 
         if ($redialRunning) {
-            $lblRedialState.Text = ('运行中 · {0}' -f $script:RedialArgText)
+            # 定时器 1 秒一轮，所以这两项是每秒在走字的：已尝试几次 + 已持续多久。
+            $elapsed = '—'
+            if ($script:RedialStartedAt) {
+                $elapsed = Format-Elapsed -Seconds ([int]((Get-Date) - $script:RedialStartedAt).TotalSeconds)
+            }
+            $lblRedialState.Text = ('运行中 · 尝试 {0} 次 · {1}' -f $script:RedialAttempts, $elapsed)
             $lblRedialState.ForeColor = [System.Drawing.Color]::DarkGreen
             $lblRedialHint.Text = '正在跑，日志区会实时更新；要停就点「停止」。'
         }
@@ -662,7 +702,8 @@ function Update-Status {
     param([switch]$Fresh)
 
     $s = $null
-    if (Test-ManagerRunning) {
+    $script:EngineRunningForStatus = Test-ManagerRunning
+    if ($script:EngineRunningForStatus) {
         # 管理器在跑：status.json 每轮都在重写，读文件最省。
         $s = Get-StatusObject
     }

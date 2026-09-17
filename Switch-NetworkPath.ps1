@@ -70,6 +70,10 @@ $script:StopFile = $null            # logs\stop.req —— 存在就优雅退出
 $script:RuntimeState = 'starting'   # starting/dialing/verifying/parked/primary/stopping
 $script:HealthySeconds = 0
 $script:LastCheckResult = ''
+# 给 GUI 看的计数器：本会话一共拨了多少次（**没成功就一直往上加**），以及当前连续失败了几次。
+# $dialFailCount 在循环里会被重置，这里先初始化一次，好让免提权的 -StatusJson 也能读到。
+$script:DialAttempts = 0
+$dialFailCount = 0
 # Wi-Fi 存活探测要 ping（约 1 秒），而状态文件每 3 秒就要写一次，所以缓存起来、
 # 最多 15 秒真探一次；真正做决策的路径（停放前、降级前）仍然直接调 Test-WifiAlive 拿实时值。
 $script:WifiAliveCache = $null
@@ -327,6 +331,7 @@ function Test-WifiAlive {
 }
 
 function Connect-Dialup {
+    $script:DialAttempts++
     $output = & rasdial.exe $DialName 2>&1 | Out-String
     if ($LASTEXITCODE -eq 0) { return $true }
     Write-Log ("拨号失败：{0}" -f ($output.Trim() -replace "`r?`n", ' / ')) 'WARN'
@@ -696,6 +701,8 @@ function Get-StatusObject {
         bestDefaultIfIndex = $(if ($best) { $best.InterfaceIndex } else { $null })
         bestDefaultAlias   = $(if ($best) { $best.InterfaceAlias } else { $null })
         healthySeconds     = $script:HealthySeconds
+        dialAttempts       = $script:DialAttempts
+        dialFailStreak     = $dialFailCount
         lastCheck          = $script:LastCheckResult
         logPath            = $script:LogFile
     }
