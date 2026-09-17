@@ -15,7 +15,8 @@
 [CmdletBinding()]
 param(
     [string]$Source,
-    [string]$Out
+    [string]$Out,
+    [switch]$KeepWhiteBackground
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,20 +71,55 @@ $src = [System.Drawing.Image]::FromFile($Source)
 try {
     Write-Output ("     尺寸 {0}×{1}   像素格式 {2}" -f $src.Width, $src.Height, $src.PixelFormat)
 
-    $frames = @()
-    foreach ($s in $sizes) {
-        $bmp = New-Object System.Drawing.Bitmap($s, $s, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
+    # 先缩到 512×512 当母版，再抠白、再逐档缩放。
+    #   - 缩到 512 是为了让"抠白"这一步不至于在 1870² 上跑（那会慢很多）
+    #   - 校徽本身是**白底红图**：白底在托盘/任务栏上就是一块白方块，几乎看不见，
+    #     所以默认把纯白抠成透明（想保留白底就加 -KeepWhiteBackground）。
+    $master = New-Object System.Drawing.Bitmap(512, 512, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    try {
+        $g = [System.Drawing.Graphics]::FromImage($master)
         try {
             $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
             $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
             $g.Clear([System.Drawing.Color]::Transparent)
-            $g.DrawImage($src, 0, 0, $s, $s)
+            $g.DrawImage($src, 0, 0, 512, 512)
         }
         finally { $g.Dispose() }
-        $frames += , @{ Size = $s; Bytes = (Get-DibBytes -Bmp $bmp) }
-        $bmp.Dispose()
+
+        if (-not $KeepWhiteBackground) {
+            $master.MakeTransparent([System.Drawing.Color]::White)
+            # 抗锯齿会在边缘留一圈近白像素，连同它们一起抠掉，否则小尺寸会有白边。
+            $rect = New-Object System.Drawing.Rectangle 0, 0, 512, 512
+            $data = $master.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadWrite, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            try {
+                $raw = New-Object byte[] ($data.Stride * 512)
+                [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $raw, 0, $raw.Length)
+                for ($i = 0; $i -lt $raw.Length; $i += 4) {
+                    $b = $raw[$i]; $gg = $raw[$i + 1]; $r = $raw[$i + 2]
+                    if ($b -gt 235 -and $gg -gt 235 -and $r -gt 235) { $raw[$i + 3] = 0 }
+                }
+                [System.Runtime.InteropServices.Marshal]::Copy($raw, 0, $data.Scan0, $raw.Length)
+            }
+            finally { $master.UnlockBits($data) }
+            Write-Output '     已把白底抠成透明（想保留白底加 -KeepWhiteBackground）'
+        }
+
+        $frames = @()
+        foreach ($s in $sizes) {
+            $bmp = New-Object System.Drawing.Bitmap($s, $s, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            try {
+                $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+                $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+                $g.Clear([System.Drawing.Color]::Transparent)
+                $g.DrawImage($master, 0, 0, $s, $s)
+            }
+            finally { $g.Dispose() }
+            $frames += , @{ Size = $s; Bytes = (Get-DibBytes -Bmp $bmp) }
+            $bmp.Dispose()
+        }
     }
+    finally { $master.Dispose() }
 }
 finally { $src.Dispose() }
 

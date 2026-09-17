@@ -871,23 +871,23 @@ if (Test-Path -LiteralPath $iconPath) {
 }
 
 function Exit-App {
-    # 界面上的「退出」和托盘右键的「退出」都走这里
+    # 「是」= 退出，并把正在跑的模式一起停掉；「否」= 什么都不做。
+    # （原来是三选一、"是"反而表示"只关界面"，可 MessageBox 的按钮标签自带
+    #   "是/否"的固有含义，自定义语义很容易点反 —— 实测就点反了。）
     $gameRunning = Test-ManagerRunning
     $redialRunning = [bool]($script:RedialProc -and -not $script:RedialProc.HasExited)
     if ($gameRunning -or $redialRunning) {
         $names = @()
         if ($gameRunning) { $names += '游戏模式' }
         if ($redialRunning) { $names += '重拨模式' }
-        $nl = [Environment]::NewLine
-        $msg = ('现在还有 {0} 在跑。{1}{1}「是」= 只关界面，它们继续在后台工作（随时重开界面接管）{1}「否」= 连它们一起停掉{1}「取消」= 什么都不做' -f ($names -join ' 和 '), $nl)
-        $answer = [System.Windows.Forms.MessageBox]::Show($msg, '退出前确认', 'YesNoCancel', 'Question')
-        if ($answer -eq 'Cancel') { return }
-        if ($answer -eq 'No') {
-            if ($redialRunning) { [void](Stop-Redial -Reason '退出时一起停掉') }
-            if ($gameRunning) { [void](Stop-GameMode) }
-        }
+        $msg = ('要退出吗？正在跑的 {0} 会一起停掉（管理器走优雅退出，把电话簿还原成拨号优先）。' -f ($names -join ' 和 '))
+        $answer = [System.Windows.Forms.MessageBox]::Show($msg, '退出', 'YesNo', 'Question')
+        if ($answer -ne 'Yes') { return }
+        if ($redialRunning) { [void](Stop-Redial -Reason '退出时一起停掉') }
+        if ($gameRunning) { [void](Stop-GameMode) }
     }
     $script:ReallyExiting = $true
+    try { Add-LogLine '正在退出。' } catch { }
     try { $timer.Stop() } catch { }
     try { $tray.Visible = $false; $tray.Dispose() } catch { }
     $form.Close()
@@ -907,6 +907,12 @@ $miOpen = $trayMenu.Items.Add('打开界面')
 [void]$trayMenu.Items.Add('-')
 $miExit = $trayMenu.Items.Add('退出')
 $tray.ContextMenuStrip = $trayMenu
+
+# 记一条日志：万一托盘里找不到图标，至少能从这里确认"图标确实创建了"。
+Add-LogLine ('托盘图标已创建（{0}）。Win11 默认把新托盘图标收进折叠区，记得拖出来钉住。' -f $(
+    if ($script:TrayIcon) { 'app.ico 的 16×16 帧' }
+    elseif ($form.Icon) { 'app.ico 的默认帧' }
+    else { '系统默认图标（没找到 app.ico）' }))
 
 $showWindow = {
     $form.Show()
@@ -947,6 +953,7 @@ $form.Add_FormClosing({
     # 点 X ≠ 退出：收进托盘（管理器继续跑）。要真退出走托盘右键或界面上的「退出」。
     $e.Cancel = $true
     $form.Hide()
+    Add-LogLine '窗口已收进托盘（程序还在跑）；退出：右键托盘图标 →「退出」，或界面上的「退出」按钮。'
     if (-not $script:BalloonShown) {
         $script:BalloonShown = $true
         try { $tray.ShowBalloonTip(3000, '还在后台运行', '关掉窗口只是收起界面。退出：右键任务栏托盘图标 → 退出。', 'Info') } catch { }
