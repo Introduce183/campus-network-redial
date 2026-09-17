@@ -467,22 +467,29 @@ $form.Controls.Add($txtOutput)
 $btnRestore = New-Object System.Windows.Forms.Button
 $btnRestore.Text = '恢复拨号优先'
 $btnRestore.Location = New-Object System.Drawing.Point(16, 664)
-$btnRestore.Size = New-Object System.Drawing.Size(150, 30)
+$btnRestore.Size = New-Object System.Drawing.Size(121, 30)
 $form.Controls.Add($btnRestore)
 
 $btnBoth = New-Object System.Windows.Forms.Button
 $btnBoth.Text = '测一轮双出口'
-$btnBoth.Location = New-Object System.Drawing.Point(176, 664)
-$btnBoth.Size = New-Object System.Drawing.Size(150, 30)
+$btnBoth.Location = New-Object System.Drawing.Point(145, 664)
+$btnBoth.Size = New-Object System.Drawing.Size(121, 30)
 $form.Controls.Add($btnBoth)
 
 # 一个按钮干两件事：拨号连着就断开、断开就拨上（标签跟着状态变）。
 # 断开不碰电话簿开关 —— 下次拨上来照样是"拨号优先"。
 $btnDial = New-Object System.Windows.Forms.Button
 $btnDial.Text = '断开拨号'
-$btnDial.Location = New-Object System.Drawing.Point(336, 664)
-$btnDial.Size = New-Object System.Drawing.Size(188, 30)
+$btnDial.Location = New-Object System.Drawing.Point(274, 664)
+$btnDial.Size = New-Object System.Drawing.Size(121, 30)
 $form.Controls.Add($btnDial)
+
+# 真正退出（和托盘右键那个「退出」一个动作：会先问要不要连模式一起停）
+$btnExit = New-Object System.Windows.Forms.Button
+$btnExit.Text = '退出'
+$btnExit.Location = New-Object System.Drawing.Point(403, 664)
+$btnExit.Size = New-Object System.Drawing.Size(121, 30)
+$form.Controls.Add($btnExit)
 
 function Add-LogLine {
     param([string]$Text)
@@ -851,6 +858,63 @@ $btnDial.Add_Click({
     Update-Status -Fresh | Out-Null
 })
 
+# ---------------------------------------------------------------- 图标 / 托盘 / 退出
+
+# 图标：exe 里内嵌了 app.ico，启动时解到脚本旁边，这里拿它当窗口图标和托盘图标。
+# 文件不在也不影响使用（退回系统默认图标）。
+$iconPath = Join-Path $script:Root 'app.ico'
+if (Test-Path -LiteralPath $iconPath) {
+    try { $form.Icon = New-Object System.Drawing.Icon($iconPath) } catch { }
+}
+
+function Exit-App {
+    # 界面上的「退出」和托盘右键的「退出」都走这里
+    $gameRunning = Test-ManagerRunning
+    $redialRunning = [bool]($script:RedialProc -and -not $script:RedialProc.HasExited)
+    if ($gameRunning -or $redialRunning) {
+        $names = @()
+        if ($gameRunning) { $names += '游戏模式' }
+        if ($redialRunning) { $names += '重拨模式' }
+        $nl = [Environment]::NewLine
+        $msg = ('现在还有 {0} 在跑。{1}{1}「是」= 只关界面，它们继续在后台工作（随时重开界面接管）{1}「否」= 连它们一起停掉{1}「取消」= 什么都不做' -f ($names -join ' 和 '), $nl)
+        $answer = [System.Windows.Forms.MessageBox]::Show($msg, '退出前确认', 'YesNoCancel', 'Question')
+        if ($answer -eq 'Cancel') { return }
+        if ($answer -eq 'No') {
+            if ($redialRunning) { [void](Stop-Redial -Reason '退出时一起停掉') }
+            if ($gameRunning) { [void](Stop-GameMode) }
+        }
+    }
+    $script:ReallyExiting = $true
+    try { $timer.Stop() } catch { }
+    try { $tray.Visible = $false; $tray.Dispose() } catch { }
+    $form.Close()
+}
+
+# 托盘：关窗口只是收起来，右键托盘才真退出
+$script:ReallyExiting = $false
+$script:BalloonShown = $false
+
+$tray = New-Object System.Windows.Forms.NotifyIcon
+$tray.Text = '校园网网络管理器'
+$tray.Icon = if ($form.Icon) { $form.Icon } else { [System.Drawing.SystemIcons]::Application }
+$tray.Visible = $true
+
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$miOpen = $trayMenu.Items.Add('打开界面')
+[void]$trayMenu.Items.Add('-')
+$miExit = $trayMenu.Items.Add('退出')
+$tray.ContextMenuStrip = $trayMenu
+
+$showWindow = {
+    $form.Show()
+    $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+    [void]$form.Activate()
+}
+$miOpen.Add_Click($showWindow)
+$tray.Add_MouseDoubleClick($showWindow)
+$miExit.Add_Click({ Exit-App })
+$btnExit.Add_Click({ Exit-App })
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
 $timer.Add_Tick({
@@ -872,9 +936,18 @@ $form.Add_Shown({
 })
 
 $form.Add_FormClosing({
-    # 关窗口**不**自动停任何模式：开不开由用户显式控制。
-    # 只把定时器停掉，避免界面销毁后回调还在跑。
-    $timer.Stop()
+    param($sender, $e)
+    if ($script:ReallyExiting) {
+        $timer.Stop()
+        return
+    }
+    # 点 X ≠ 退出：收进托盘（管理器继续跑）。要真退出走托盘右键或界面上的「退出」。
+    $e.Cancel = $true
+    $form.Hide()
+    if (-not $script:BalloonShown) {
+        $script:BalloonShown = $true
+        try { $tray.ShowBalloonTip(3000, '还在后台运行', '关掉窗口只是收起界面。退出：右键任务栏托盘图标 → 退出。', 'Info') } catch { }
+    }
 })
 
 [void]$form.ShowDialog()

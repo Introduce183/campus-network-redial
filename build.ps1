@@ -27,7 +27,7 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 if (-not $OutPath) { $OutPath = Join-Path $root 'CampusNetwork.exe' }
 
-# 打进 exe 的脚本。**顺序固定**：host.cs 里的 ScriptNames 必须与之一致。
+# 打进 exe 的脚本。host.cs 是用 "scripts." 前缀扫内嵌资源的，所以这里加文件不用改 host.cs。
 $scripts = @(
     'CampusNetworkUI.ps1'
     'Switch-NetworkPath.ps1'
@@ -36,6 +36,11 @@ $scripts = @(
     'Set-AutoStart.ps1'
     'Redial-UntilCampusReady.ps1'
 )
+
+# 图标（app.ico）若在就打进 exe：既当 exe 的文件图标，也解压出来给窗口和托盘用。没有也能编。
+$assets = @($scripts)
+$iconPath = Join-Path $root 'app.ico'
+if (Test-Path -LiteralPath $iconPath) { $assets += 'app.ico' }
 
 function Find-Csc {
     $candidates = @(
@@ -54,7 +59,7 @@ Write-Output ("csc   : {0}" -f $csc)
 Write-Output ("        {0}" -f (Get-Item -LiteralPath $csc).VersionInfo.FileVersion)
 
 $missing = @()
-foreach ($s in $scripts) {
+foreach ($s in $assets) {
     if (-not (Test-Path -LiteralPath (Join-Path $root $s))) { $missing += $s }
 }
 $manifest = Join-Path $root 'app.manifest'
@@ -64,7 +69,7 @@ if ($missing.Count) {
     throw ("缺少源文件，无法编译：{0}" -f ($missing -join ', '))
 }
 
-foreach ($s in $scripts) {
+foreach ($s in $assets) {
     $f = Get-Item -LiteralPath (Join-Path $root $s)
     Write-Output ('  {0,-30} {1,8} 字节' -f $s, $f.Length)
 }
@@ -90,7 +95,8 @@ $cscArgs = @(
     ('/win32manifest:' + $manifest)
     ('/out:' + $OutPath)
 )
-foreach ($s in $scripts) {
+if (Test-Path -LiteralPath $iconPath) { $cscArgs += ('/win32icon:' + $iconPath) }
+foreach ($s in $assets) {
     $cscArgs += ('/resource:{0},scripts.{1}' -f (Join-Path $root $s), $s)
 }
 $cscArgs += (Join-Path $root 'host.cs')
@@ -110,7 +116,7 @@ if (-not $SkipVerify) {
     Write-Output '=== 自检 ==='
 
     # 1) 内嵌资源齐不齐（反射读元数据，不执行 exe）
-    $expected = @($scripts | ForEach-Object { 'scripts.' + $_ })
+    $expected = @($assets | ForEach-Object { 'scripts.' + $_ })
     $actual = @([System.Reflection.Assembly]::ReflectionOnlyLoadFrom($OutPath).GetManifestResourceNames())
     $missingRes = @($expected | Where-Object { $actual -notcontains $_ })
     if ($missingRes.Count) {

@@ -1,4 +1,4 @@
-﻿// 校园网网络管理器 —— exe 宿主（引导器）。
+// 校园网网络管理器 —— exe 宿主（引导器）。
 //
 // 这个 exe 只做三件事，**不含任何业务逻辑**：
 //   1. 把内嵌的 .ps1 脚本解出来（%LOCALAPPDATA%\CampusNetworkRedial\scripts）——每次启动都按内容哈希核对，
@@ -31,16 +31,8 @@ static class Program
     const int AttachParentProcess = -1;
     const uint MbIconError = 0x00000010;
 
-    // 顺序固定：它同时是下面 version 计算的输入顺序。
-    static readonly string[] ScriptNames =
-    {
-        "CampusNetworkUI.ps1",
-        "Switch-NetworkPath.ps1",
-        "Test-CampusExit.ps1",
-        "Test-BothExits.ps1",
-        "Set-AutoStart.ps1",
-        "Redial-UntilCampusReady.ps1",
-    };
+    // 打进 exe 的资源**不写死**：用 "scripts." 前缀扫一遍就行。
+    // 这样以后增删文件（比如加 app.ico）不用改 host.cs，哈希核对也自动覆盖新文件。
 
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool AttachConsole(int dwProcessId);
@@ -59,7 +51,7 @@ static class Program
                     : DefaultExtractDir();
                 Extract(target, true);
                 Say("脚本已导出到：" + target + Environment.NewLine +
-                    string.Join(Environment.NewLine, Prefix(target)));
+                    string.Join(Environment.NewLine, ListNames(target)));
                 return 0;
             }
 
@@ -92,14 +84,15 @@ static class Program
             || string.Equals(value, "/" + expected.TrimStart('-'), StringComparison.OrdinalIgnoreCase);
     }
 
-    static string[] Prefix(string dir)
+    static string[] ListNames(string dir)
     {
-        var lines = new string[ScriptNames.Length];
-        for (int i = 0; i < ScriptNames.Length; i++)
+        var lines = new List<string>();
+        foreach (string f in Directory.GetFiles(dir))
         {
-            lines[i] = "  " + Path.Combine(dir, ScriptNames[i]);
+            lines.Add("  " + f);
         }
-        return lines;
+        lines.Sort(StringComparer.Ordinal);
+        return lines.ToArray();
     }
 
     static void Say(string text)
@@ -128,21 +121,32 @@ static class Program
     {
         Assembly asm = Assembly.GetExecutingAssembly();
         var map = new Dictionary<string, byte[]>(StringComparer.Ordinal);
-        foreach (string name in ScriptNames)
+        foreach (string full in asm.GetManifestResourceNames())
         {
-            using (Stream s = asm.GetManifestResourceStream(ResourcePrefix + name))
+            if (!full.StartsWith(ResourcePrefix, StringComparison.Ordinal))
+            {
+                continue;
+            }
+            using (Stream s = asm.GetManifestResourceStream(full))
             {
                 if (s == null)
                 {
-                    throw new InvalidOperationException("这个 exe 里没有内嵌资源：" + ResourcePrefix + name
-                        + "（重新跑一次 build.ps1）");
+                    continue;
                 }
                 using (var ms = new MemoryStream())
                 {
                     s.CopyTo(ms);
-                    map[name] = ms.ToArray();
+                    map[full.Substring(ResourcePrefix.Length)] = ms.ToArray();
                 }
             }
+        }
+        if (map.Count == 0)
+        {
+            throw new InvalidOperationException("这个 exe 里一个内嵌资源都没有（重新跑一次 build.ps1）。");
+        }
+        if (!map.ContainsKey(UiScript))
+        {
+            throw new InvalidOperationException("内嵌资源里没有界面脚本 " + UiScript + "（重新跑一次 build.ps1）。");
         }
         return map;
     }
@@ -164,7 +168,10 @@ static class Program
     static string VersionOf(Dictionary<string, byte[]> scripts)
     {
         var sb = new StringBuilder();
-        foreach (string name in ScriptNames)
+        // 排序后拼：顺序必须稳定，否则同样的内容会算出不同的版本号、每次启动都重解压。
+        var names = new List<string>(scripts.Keys);
+        names.Sort(StringComparer.Ordinal);
+        foreach (string name in names)
         {
             sb.Append(name).Append(':').Append(HashOf(scripts[name])).Append(';');
         }
