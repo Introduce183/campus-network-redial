@@ -863,8 +863,11 @@ $btnDial.Add_Click({
 # 图标：exe 里内嵌了 app.ico，启动时解到脚本旁边，这里拿它当窗口图标和托盘图标。
 # 文件不在也不影响使用（退回系统默认图标）。
 $iconPath = Join-Path $script:Root 'app.ico'
+$script:TrayIcon = $null
 if (Test-Path -LiteralPath $iconPath) {
     try { $form.Icon = New-Object System.Drawing.Icon($iconPath) } catch { }
+    # 托盘只有 16×16 大小，单独取那一帧比缩放 32×32 清楚
+    try { $script:TrayIcon = New-Object System.Drawing.Icon($iconPath, 16, 16) } catch { }
 }
 
 function Exit-App {
@@ -896,7 +899,7 @@ $script:BalloonShown = $false
 
 $tray = New-Object System.Windows.Forms.NotifyIcon
 $tray.Text = '校园网网络管理器'
-$tray.Icon = if ($form.Icon) { $form.Icon } else { [System.Drawing.SystemIcons]::Application }
+$tray.Icon = if ($script:TrayIcon) { $script:TrayIcon } elseif ($form.Icon) { $form.Icon } else { [System.Drawing.SystemIcons]::Application }
 $tray.Visible = $true
 
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
