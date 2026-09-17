@@ -546,6 +546,8 @@ function Format-StatusText {
     $stateText = switch -Wildcard ($S.state) {
         'idle' { '未运行' }
         'starting' { '启动中' }
+        'dialing' { '正在拨号换出口：流量还在 Wi-Fi 上，你不受影响' }
+        'verifying' { '正在验证出口' }
         'parked' { '停放中：流量走 Wi-Fi，拨号在后台当候选' }
         'primary' { '主用中：流量走拨号' }
         'stopping' { '正在停止' }
@@ -661,6 +663,8 @@ function Update-UiStates {
             $modeLine = switch -Wildcard ([string]$S.state) {
                 'primary' { '游戏模式运行中：【拨号正在承载】—— 这个出口已通过三轮验证；变坏会立刻退回 Wi-Fi。' }
                 'parked' { '游戏模式运行中：【流量走 Wi-Fi】—— 拨号在后台当候选，确认到好出口才会切过去。' }
+                'dialing' { '游戏模式运行中：正在换出口（流量还在 Wi-Fi 上，你不受影响）。' }
+                'verifying' { '游戏模式运行中：正在验证新出口（还在 Wi-Fi 上）。' }
                 default { '游戏模式运行中：正在启动或切换（看上面的状态行）。' }
             }
             $lblGameHint.Text = $modeLine + [Environment]::NewLine + '只保证一直都有可用网络，可能会在校园网与热点之间切换，不保证游戏时的稳定性。'
