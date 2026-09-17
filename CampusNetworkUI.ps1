@@ -506,6 +506,7 @@ $script:RedialDone = $false
 $script:TailOffsets = @{}
 $script:LastStatus = $null
 $script:FreshStatusDue = [datetime]::MinValue
+$script:CarrierEvidence = ''   # 「重新检测」时做一次行为确认（curl 看源地址），显示在状态面板最后一行
 
 function Format-StatusText {
     param([pscustomobject]$S)
@@ -515,26 +516,60 @@ function Format-StatusText {
         'wifi' { 'Wi-Fi（热点）' }
         default { [string]$S.carrier }
     }
+    # 把引擎内部的状态名翻成人话 —— 原来直接把 parked/primary 打出来，
+    # 再加上"流量跟着 Wi-Fi 走"那句固定文案，主用时会显得自相矛盾。
+    $stateText = switch -Wildcard ($S.state) {
+        'idle' { '未运行' }
+        'starting' { '启动中' }
+        'parked' { '停放中：流量走 Wi-Fi，拨号在后台当候选' }
+        'primary' { '主用中：流量走拨号' }
+        'stopping' { '正在停止' }
+        'stopped' { '已停止' }
+        default { [string]$S.state }
+    }
     $dialText = if ($S.dialConnected) { ('已连接 {0}' -f $S.dialIp) } else { '未连接' }
-    $parkText = if ($S.parkSwitch -eq '0') { '0（拨号不当默认网关 = 停放态）' } else { '1（拨号当默认网关）' }
-    # 这一对刻意分开显示：电话簿说"停放"、而拨号仍握着默认路由，正是会引发启动报错的那种不一致。
+    # 主用时拨号是引擎临时加的路由，电话簿开关仍然是 0，所以别把 0 一律叫"停放态"。
+    $parkText = if ($S.parkSwitch -eq '0') {
+        '0（拨号自己不装默认路由；引擎要切主用时才临时加一条）'
+    }
+    else { '1（拨号一连上就是默认网关）' }
+    # 这一对刻意分开显示：电话簿说"停放"、而拨号仍握着默认路由，就是引擎在主用。
     $holdsText = if ($S.dialHoldsDefault) { '是' } else { '否' }
     $healthyText = if ($S.healthySeconds -gt 0) {
         '{0} 分 {1} 秒' -f [int]([Math]::Floor($S.healthySeconds / 60)), ($S.healthySeconds % 60)
     }
     else { '—' }
 
-    @(
+    $lines = @(
         ('当前承载   ：{0}' -f $carrierText)
-        ('运行状态   ：{0}' -f $S.state)
+        ('运行状态   ：{0}' -f $stateText)
         ('健康已持续 ：{0}' -f $healthyText)
         ('最近检查   ：{0}' -f $(if ($S.lastCheck) { $S.lastCheck } else { '—' }))
         ('拨号       ：{0}' -f $dialText)
         ('电话簿开关 ：{0}' -f $parkText)
         ('拨号握默认 ：{0}' -f $holdsText)
         ('Wi-Fi      ：{0} {1} {2}   保底可用：{3}' -f $S.wifiName, $S.wifiStatus, $S.wifiIp, $(if ($S.wifiAlive) { '是' } else { '否' }))
-        ('状态时间   ：{0}' -f $S.time)
-    ) -join [Environment]::NewLine
+    )
+    if ($script:CarrierEvidence) { $lines += ('行为确认   ：{0}' -f $script:CarrierEvidence) }
+    $lines += ('状态时间   ：{0}' -f $S.time)
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Get-CarrierEvidence {
+    # "当前承载"是路由表算出来的（预选），这里补一次**行为真相**：发一个请求，看源地址是哪条路。
+    # 这是唯一可信的判据（路由表在两种"没有默认路由"的状态下会说谎）。
+    param([pscustomobject]$S)
+    if (-not $S) { return '拿不到状态，没法做行为确认' }
+    try {
+        $raw = & curl.exe -s -o NUL --max-time 6 -4 -w '%{http_code}|%{local_ip}' 'https://kernel.org/'
+    }
+    catch { return '行为确认失败：curl 起不来' }
+    $parts = ([string]$raw) -split '\|'
+    $src = if ($parts.Count -ge 2) { $parts[1].Trim() } else { '' }
+    if (-not $src) { return '没拿到源地址（目标不可达？）' }
+    $which = if ($src -eq $S.dialIp) { '拨号' } elseif ($src -eq $S.wifiIp) { 'Wi-Fi' } else { ('未知接口 ' + $src) }
+    $match = if (($S.carrier -eq 'pppoe' -and $which -eq '拨号') -or ($S.carrier -eq 'wifi' -and $which -eq 'Wi-Fi')) { '与上面的承载一致 ✓' } else { '⚠ 与上面的承载不一致！' }
+    return ('这次请求源地址 = {0}（{1}）{2}' -f $src, $which, $match)
 }
 
 function Update-UiStates {
@@ -581,7 +616,14 @@ function Update-UiStates {
         $chkAutoStart.Enabled = -not $redialRunning
 
         if ($gameRunning) {
-            $lblGameHint.Text = '游戏模式运行中：拨号在后台当候选，流量跟着 Wi-Fi 走；确认到好出口会切过去，变坏立刻退回。' + [Environment]::NewLine + '只保证一直都有可用网络，不保证游戏时的稳定性。'
+            # 文案必须跟着真实状态走：原来固定写"流量跟着 Wi-Fi 走"，
+            # 可一旦它把拨号晋升成主用（state=primary），那句话就是错的。
+            $modeLine = switch -Wildcard ([string]$S.state) {
+                'primary' { '游戏模式运行中：【拨号正在承载】—— 这个出口已通过三轮验证；变坏会立刻退回 Wi-Fi。' }
+                'parked' { '游戏模式运行中：【流量走 Wi-Fi】—— 拨号在后台当候选，确认到好出口才会切过去。' }
+                default { '游戏模式运行中：正在启动或切换（看上面的状态行）。' }
+            }
+            $lblGameHint.Text = $modeLine + [Environment]::NewLine + '只保证一直都有可用网络，可能会在校园网与热点之间切换，不保证游戏时的稳定性。'
             $lblGameHint.ForeColor = [System.Drawing.Color]::DimGray
         }
         elseif ($redialRunning) {
@@ -644,9 +686,15 @@ function Update-Status {
 # ---------------------------------------------------------------- 事件
 
 $btnRefresh.Add_Click({
-    Update-Status -Fresh | Out-Null
+    $s = Get-StatusObject -Fresh
+    if ($s) {
+        $script:LastStatus = $s
+        # 顺手做一次行为确认：路由表只能"预选"，源地址才是真相。
+        $script:CarrierEvidence = Get-CarrierEvidence -S $s
+    }
+    Update-Status | Out-Null
     Update-AutoStartSwitch
-    Add-LogLine '已重新检测状态。'
+    Add-LogLine ('已重新检测。行为确认：' + $script:CarrierEvidence)
 })
 
 $btnRedialStart.Add_Click({
