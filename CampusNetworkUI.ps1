@@ -35,6 +35,24 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
+# 给这个进程一个**自己的任务栏身份**。
+# 界面是跑在 powershell.exe 里的，默认会继承 PowerShell 的 AppUserModelID ——
+# 任务栏/托盘就会按 PowerShell 来归类（实测：系统里连一条属于本程序的托盘图标记录都没有），
+# 按钮图标也可能跟着用宿主的。设了自己的 ID 之后，Windows 按窗口自己的图标来画。
+# 必须在创建任何窗口之前调用。
+try {
+    Add-Type -Namespace Win32 -Name AppId -MemberDefinition @'
+[DllImport("shell32.dll", SetLastError = true)]
+public static extern int SetCurrentProcessExplicitAppUserModelID(
+    [System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.LPWStr)] string AppID);
+'@ -ErrorAction Stop
+    $hr = [Win32.AppId]::SetCurrentProcessExplicitAppUserModelID('Introduce183.CampusNetworkRedial')
+    $script:AppIdResult = $hr      # 0 = S_OK；非 0 说明没设上，会写进 logs\ui.log 方便排查
+}
+catch {
+    # 这里不能用 Write-UiError：它定义在下面的路径段之后，此刻还不存在（纯可选功能，静默即可）
+}
+
 # ---------------------------------------------------------------- 路径
 
 $script:Root = $PSScriptRoot
@@ -909,10 +927,10 @@ $miExit = $trayMenu.Items.Add('退出')
 $tray.ContextMenuStrip = $trayMenu
 
 # 记一条日志：万一托盘里找不到图标，至少能从这里确认"图标确实创建了"。
-Add-LogLine ('托盘图标已创建（{0}）。Win11 默认把新托盘图标收进折叠区，记得拖出来钉住。' -f $(
+Add-LogLine ('托盘图标已创建（{0}）。Win11 默认把新托盘图标收进折叠区，记得拖出来钉住。任务栏身份 hr={1}' -f $(
     if ($script:TrayIcon) { 'app.ico 的 16×16 帧' }
     elseif ($form.Icon) { 'app.ico 的默认帧' }
-    else { '系统默认图标（没找到 app.ico）' }))
+    else { '系统默认图标（没找到 app.ico）' }), $(if ($null -ne $script:AppIdResult) { ('0x{0:X}' -f $script:AppIdResult) } else { '未设置' }))
 
 $showWindow = {
     $form.Show()
