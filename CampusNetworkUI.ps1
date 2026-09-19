@@ -106,6 +106,28 @@ function Write-UiError {
     Write-UiError -Where 'ThreadException' -Err $e.Exception
 })
 
+function Read-FileShared {
+    # 读一个"可能正被别的进程写着"的文件。
+    # ⚠️ 关键：不能直接用 [IO.File]::ReadAllText —— 它对**正被占用写入**的文件会抛
+    # IOException（实测重拨脚本运行期间就是这样），一旦异常被吞掉，界面就一条输出都收不到、
+    # "尝试次数"永远停在 0（这就是用户报的"跑了两分钟还是 0 次"）。
+    # 用 FileShare.ReadWrite 打开才能边写边读。
+    param([string]$Path, [System.Text.Encoding]$Encoding)
+    if (-not $Encoding) { $Encoding = $script:ChildEncoding }
+    $fs = $null
+    $sr = $null
+    try {
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $sr = New-Object System.IO.StreamReader($fs, $Encoding)
+        return $sr.ReadToEnd()
+    }
+    catch { return $null }
+    finally {
+        if ($sr) { try { $sr.Dispose() } catch { } }
+        elseif ($fs) { try { $fs.Dispose() } catch { } }
+    }
+}
+
 # ---------------------------------------------------------------- 通用
 
 function Invoke-Hidden {
@@ -175,7 +197,10 @@ function Get-StatusObject {
 
     if (-not $Fresh) {
         if (-not (Test-Path -LiteralPath $script:StatusFile)) { return $null }
-        try { return ([IO.File]::ReadAllText($script:StatusFile) | ConvertFrom-Json) } catch { return $null }
+        # 引擎可能正在重写这个文件，所以同样用共享读（status.json 是 UTF-8）。
+        $fileText = Read-FileShared -Path $script:StatusFile -Encoding ([Text.UTF8Encoding]::new($false))
+        if (-not $fileText) { return $null }
+        try { return ($fileText | ConvertFrom-Json) } catch { return $null }
     }
     $r = Invoke-Hidden -Target @($script:EnginePath, '-StatusJson') -TimeoutSeconds 60
     try { return ($r.Output | ConvertFrom-Json) } catch { return $null }
@@ -303,9 +328,9 @@ function Append-NewOutput {
     param([string]$Path, [string]$Tag)
 
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return }
-    $text = ''
-    # 用 ANSI 码页读：子进程被重定向时按系统 ANSI 码页写，不是 UTF-8。
-    try { $text = [IO.File]::ReadAllText($Path, $script:ChildEncoding) } catch { return }
+    # 用共享读：重拨脚本运行期间这个文件一直被它占着写，普通 ReadAllText 会抛异常。
+    $text = Read-FileShared -Path $Path
+    if ($null -eq $text) { return }
     if (-not $script:TailOffsets.ContainsKey($Tag)) { $script:TailOffsets[$Tag] = 0 }
     $off = $script:TailOffsets[$Tag]
     if ($text.Length -lt $off) { $off = 0 }
