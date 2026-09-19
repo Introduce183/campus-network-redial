@@ -250,10 +250,20 @@ function Start-Redial {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $script:RedialOutFile = Join-Path $script:LogDir ("redial-$stamp.out.txt")
     $script:RedialErrFile = Join-Path $script:LogDir ("redial-$stamp.err.txt")
-    # 给子进程一个**空的 stdin**：重拨脚本找到好出口后会 Read-Host 问"要不要继续"，
-    # 读到 EOF 就按"其它键"处理并正常退出 —— GUI 里没有键盘给它。
+    # 子进程的 stdin：
+    #   - 勾了「继续盯着」→ 喂一长串 Y，等于替用户一直按脚本那个"输入 Y 继续测速或者重新拨号"
+    #     的询问：拿到好出口不退出，隔一轮再探一次，探到坏的就自动重新拨号。
+    #   - 没勾 → 给个空文件，读到 EOF 就按"其它键"处理并正常退出（一次性模式）。
+    # 只测/高速模式跑完自己就退，用不到这个输入。
+    $script:KeepWatching = [bool]($script:ChkWatch.Checked -and -not $script:RadioTestOnly.Checked -and -not $script:RadioHighBandwidth.Checked)
+    $script:WatchNoticeShown = $false
     $script:RedialStdinFile = Join-Path $env:TEMP ("redial-$stamp.in.txt")
-    Set-Content -LiteralPath $script:RedialStdinFile -Value '' -Encoding ASCII
+    if ($script:KeepWatching) {
+        Set-Content -LiteralPath $script:RedialStdinFile -Value ((1..20000 | ForEach-Object { 'y' }) -join "`r`n") -Encoding ASCII
+    }
+    else {
+        Set-Content -LiteralPath $script:RedialStdinFile -Value '' -Encoding ASCII
+    }
 
     $script:RedialAllText = ''
     $script:TailOffsets = @{}
@@ -266,7 +276,7 @@ function Start-Redial {
     $script:RedialProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $argl -PassThru `
         -WindowStyle Hidden -RedirectStandardOutput $script:RedialOutFile `
         -RedirectStandardError $script:RedialErrFile -RedirectStandardInput $script:RedialStdinFile
-    Add-LogLine ('重拨模式已启动（{0}，pid={1}）。' -f $script:RedialArgText, $script:RedialProc.Id)
+    Add-LogLine ('重拨模式已启动（{0}，pid={1}）。{2}' -f $script:RedialArgText, $script:RedialProc.Id, $(if ($script:KeepWatching) { '拿到好出口后会继续盯着。' } else { '拿到好出口就收工。' }))
     return 'started'
 }
 
@@ -280,7 +290,7 @@ function Stop-Redial {
         if ($script:RedialProc.HasExited) { break }
     }
     Add-LogLine ('重拨模式已停止（{0}）。' -f $Reason)
-
+    $script:RedialDone = $true
     # 重拨脚本是先 disconnect 再 connect 的，如果在"断开之后、拨上之前"被杀，
     # 拨号会留在断开状态 —— 补拨一次，避免用户莫名其妙回到没拨号的状态。
     $st = Get-StatusObject -Fresh
@@ -301,7 +311,13 @@ function Update-Redial {
 
     # 脚本找到好出口后会打印"好了喵"，然后停在 Read-Host 等你按键 ——
     # GUI 里没有键盘给它，所以看到这句就当作完成，顺手把那个进程收掉（此时拨号是连着的，杀掉没有副作用）。
-    if ($running -and $script:RedialAllText -like '*好了喵*') {
+    # 勾了「继续盯着」时**不能**在这里收掉它：脚本那个 Read-Host 循环正是靠继续跑下去
+    # 才实现"隔一轮再探一次"。只有一次性模式才在拿到好出口后把它收掉。
+    if ($running -and $script:KeepWatching -and -not $script:WatchNoticeShown -and $script:RedialAllText -like '*好了喵*') {
+        $script:WatchNoticeShown = $true
+        Add-LogLine '重拨模式：已经拿到好出口 —— 按「继续盯着」在跑，之后隔一轮再探一次，坏了会自动重新拨号。'
+    }
+    if ($running -and -not $script:KeepWatching -and $script:RedialAllText -like '*好了喵*') {
         try { $script:RedialProc.Kill() } catch { }
         Start-Sleep -Milliseconds 300
         $script:RedialDone = $true
@@ -348,7 +364,8 @@ function Append-NewOutput {
     }
     foreach ($line in ($new -split "`r?`n")) {
         $t = $line.TrimEnd()
-        if ($t) { Add-LogLine ('[{0}] {1}' -f $Tag, $t) }
+        # 「继续盯着」模式下 Read-Host 会把喂进去的那个 y 回显到输出里（每轮一行），别让它刷屏
+        if ($t -and $t -notmatch '^\s*y\s*$') { Add-LogLine ('[{0}] {1}' -f $Tag, $t) }
     }
 }
 
@@ -409,13 +426,13 @@ $pageRedial.Controls.Add((New-UiLabel -Text '重新拨号，直到三轮探测�
 $grpMode = New-Object System.Windows.Forms.GroupBox
 $grpMode.Text = '运行方式'
 $grpMode.Location = New-Object System.Drawing.Point(12, 38)
-$grpMode.Size = New-Object System.Drawing.Size(470, 100)
+$grpMode.Size = New-Object System.Drawing.Size(470, 112)
 $grpMode.Font = $fontUi
 $pageRedial.Controls.Add($grpMode)
 
 $script:RadioPlain = New-Object System.Windows.Forms.RadioButton
 $script:RadioPlain.Text = '普通重拨（默认）：一直换出口，直到拿到好出口'
-$script:RadioPlain.Location = New-Object System.Drawing.Point(12, 20)
+$script:RadioPlain.Location = New-Object System.Drawing.Point(12, 18)
 $script:RadioPlain.Size = New-Object System.Drawing.Size(440, 22)
 $script:RadioPlain.Font = $fontUi
 $script:RadioPlain.Checked = $true
@@ -423,33 +440,44 @@ $grpMode.Controls.Add($script:RadioPlain)
 
 $script:RadioTestOnly = New-Object System.Windows.Forms.RadioButton
 $script:RadioTestOnly.Text = '只测当前出口：不拨号，只判断现在这条好不好'
-$script:RadioTestOnly.Location = New-Object System.Drawing.Point(12, 44)
+$script:RadioTestOnly.Location = New-Object System.Drawing.Point(12, 40)
 $script:RadioTestOnly.Size = New-Object System.Drawing.Size(440, 22)
 $script:RadioTestOnly.Font = $fontUi
 $grpMode.Controls.Add($script:RadioTestOnly)
 
 $script:RadioHighBandwidth = New-Object System.Windows.Forms.RadioButton
 $script:RadioHighBandwidth.Text = '高速模式：重拨到西电测速超过 150 Mbps'
-$script:RadioHighBandwidth.Location = New-Object System.Drawing.Point(12, 68)
+$script:RadioHighBandwidth.Location = New-Object System.Drawing.Point(12, 62)
 $script:RadioHighBandwidth.Size = New-Object System.Drawing.Size(440, 22)
 $script:RadioHighBandwidth.Font = $fontUi
 $grpMode.Controls.Add($script:RadioHighBandwidth)
 
+# 「继续盯着」的开关：勾上时给脚本喂一串 Y，等于替用户一直按它那个
+# "输入 Y 继续测速或者重新拨号"的询问 —— 于是拿到好出口之后它不会退出，
+# 而是隔一轮再探一次，探到坏的就自动重新拨号。
+$script:ChkWatch = New-Object System.Windows.Forms.CheckBox
+$script:ChkWatch.Text = '拿到好出口后继续盯着（不退出；坏了自动重新拨号）'
+$script:ChkWatch.Location = New-Object System.Drawing.Point(12, 86)
+$script:ChkWatch.Size = New-Object System.Drawing.Size(440, 22)
+$script:ChkWatch.Font = $fontUi
+$script:ChkWatch.Checked = $true
+$grpMode.Controls.Add($script:ChkWatch)
+
 $btnRedialStart = New-Object System.Windows.Forms.Button
 $btnRedialStart.Text = '开始'
-$btnRedialStart.Location = New-Object System.Drawing.Point(12, 146)
+$btnRedialStart.Location = New-Object System.Drawing.Point(12, 158)
 $btnRedialStart.Size = New-Object System.Drawing.Size(96, 30)
 $pageRedial.Controls.Add($btnRedialStart)
 
 $btnRedialStop = New-Object System.Windows.Forms.Button
 $btnRedialStop.Text = '停止'
-$btnRedialStop.Location = New-Object System.Drawing.Point(116, 146)
+$btnRedialStop.Location = New-Object System.Drawing.Point(116, 158)
 $btnRedialStop.Size = New-Object System.Drawing.Size(96, 30)
 $btnRedialStop.Enabled = $false
 $pageRedial.Controls.Add($btnRedialStop)
 
 $lblRedialState = New-Object System.Windows.Forms.Label
-$lblRedialState.Location = New-Object System.Drawing.Point(224, 152)
+$lblRedialState.Location = New-Object System.Drawing.Point(224, 164)
 $lblRedialState.Size = New-Object System.Drawing.Size(258, 22)
 $lblRedialState.Font = $fontUi
 $lblRedialState.ForeColor = [System.Drawing.Color]::DimGray
@@ -457,11 +485,11 @@ $lblRedialState.Text = '未运行'
 $pageRedial.Controls.Add($lblRedialState)
 
 $lblRedialHint = New-Object System.Windows.Forms.Label
-$lblRedialHint.Location = New-Object System.Drawing.Point(12, 182)
-$lblRedialHint.Size = New-Object System.Drawing.Size(470, 40)
+$lblRedialHint.Location = New-Object System.Drawing.Point(12, 192)
+$lblRedialHint.Size = New-Object System.Drawing.Size(470, 38)
 $lblRedialHint.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
 $lblRedialHint.ForeColor = [System.Drawing.Color]::DimGray
-$lblRedialHint.Text = '输出会实时显示在下面的日志区；这次的完整输出另外留在 logs\redial-*.out.txt。'
+$lblRedialHint.Text = '输出会实时显示在下面的日志区；完整输出另外留在 logs\redial-*.out.txt。'
 $pageRedial.Controls.Add($lblRedialHint)
 
 # ---- 标签页 2：游戏模式
@@ -563,6 +591,8 @@ $script:RedialOutFile = $null
 $script:RedialErrFile = $null
 $script:RedialAllText = ''
 $script:RedialDone = $false
+$script:KeepWatching = $false       # 本轮重拨是否启用了「拿到好出口后继续盯着」
+$script:WatchNoticeShown = $false   # 那条"已拿到好出口、继续盯着"的日志只写一次
 $script:TailOffsets = @{}
 $script:LastStatus = $null
 $script:FreshStatusDue = [datetime]::MinValue
