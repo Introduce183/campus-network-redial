@@ -238,7 +238,6 @@ function Stop-GameMode {
 # ---------------------------------------------------------------- 重拨模式
 
 function Get-RedialArgs {
-    if ($script:RadioTestOnly.Checked) { return @('-TestOnly') }
     if ($script:RadioHighBandwidth.Checked) { return @('-HighBandwidthMode') }
     return @()
 }
@@ -254,8 +253,8 @@ function Start-Redial {
     #   - 勾了「继续盯着」→ 喂一长串 Y，等于替用户一直按脚本那个"输入 Y 继续测速或者重新拨号"
     #     的询问：拿到好出口不退出，隔一轮再探一次，探到坏的就自动重新拨号。
     #   - 没勾 → 给个空文件，读到 EOF 就按"其它键"处理并正常退出（一次性模式）。
-    # 只测/高速模式跑完自己就退，用不到这个输入。
-    $script:KeepWatching = [bool]($script:ChkWatch.Checked -and -not $script:RadioTestOnly.Checked -and -not $script:RadioHighBandwidth.Checked)
+    # 高速模式跑完自己就退，用不到这个输入。
+    $script:KeepWatching = [bool]($script:ChkWatch.Checked -and -not $script:RadioHighBandwidth.Checked)
     $script:WatchNoticeShown = $false
     $script:RedialStdinFile = Join-Path $env:TEMP ("redial-$stamp.in.txt")
     if ($script:KeepWatching) {
@@ -276,7 +275,7 @@ function Start-Redial {
     $script:RedialProc = Start-Process -FilePath 'powershell.exe' -ArgumentList $argl -PassThru `
         -WindowStyle Hidden -RedirectStandardOutput $script:RedialOutFile `
         -RedirectStandardError $script:RedialErrFile -RedirectStandardInput $script:RedialStdinFile
-    Add-LogLine ('重拨模式已启动（{0}，pid={1}）。{2}' -f $script:RedialArgText, $script:RedialProc.Id, $(if ($script:KeepWatching) { '拿到好出口后会继续盯着。' } else { '拿到好出口就收工。' }))
+    Add-Important ('重拨模式已启动（{0}，pid={1}）。{2}' -f $script:RedialArgText, $script:RedialProc.Id, $(if ($script:KeepWatching) { '拿到好出口后会继续盯着。' } else { '拿到好出口就收工。' }))
     return 'started'
 }
 
@@ -289,13 +288,13 @@ function Stop-Redial {
         Start-Sleep -Milliseconds 250
         if ($script:RedialProc.HasExited) { break }
     }
-    Add-LogLine ('重拨模式已停止（{0}）。' -f $Reason)
+    Add-Important ('重拨模式已停止（{0}）。' -f $Reason)
     $script:RedialDone = $true
     # 重拨脚本是先 disconnect 再 connect 的，如果在"断开之后、拨上之前"被杀，
     # 拨号会留在断开状态 —— 补拨一次，避免用户莫名其妙回到没拨号的状态。
     $st = Get-StatusObject -Fresh
     if ($st -and -not $st.dialConnected -and $st.dialName) {
-        Add-LogLine ('检测到拨号是断开的，补拨一次：{0}' -f $st.dialName)
+        Add-Important ('检测到拨号是断开的，补拨一次：{0}' -f $st.dialName)
         try { & rasdial.exe $st.dialName | Out-Null } catch { }
     }
     return 'stopped'
@@ -315,17 +314,21 @@ function Update-Redial {
     # 才实现"隔一轮再探一次"。只有一次性模式才在拿到好出口后把它收掉。
     if ($running -and $script:KeepWatching -and -not $script:WatchNoticeShown -and $script:RedialAllText -like '*好了喵*') {
         $script:WatchNoticeShown = $true
-        Add-LogLine '重拨模式：已经拿到好出口 —— 按「继续盯着」在跑，之后隔一轮再探一次，坏了会自动重新拨号。'
+        Add-Important '重拨模式：已经拿到好出口 —— 按「继续盯着」在跑，之后隔一轮再探一次，坏了会自动重新拨号。'
     }
     if ($running -and -not $script:KeepWatching -and $script:RedialAllText -like '*好了喵*') {
         try { $script:RedialProc.Kill() } catch { }
         Start-Sleep -Milliseconds 300
         $script:RedialDone = $true
-        Add-LogLine '重拨模式：已确认拿到好出口（好了喵）—— 本次完成。'
+        Add-Important '重拨模式：已确认拿到好出口（好了喵）—— 本次完成。'
         $running = $false
     }
 
     if (-not $running -and -not $script:RedialDone -and $script:RedialProc) {
+        # 盯着模式下进程本不该退出（Stop-Redial 会先置 RedialDone，所以走到这里=提前退了）
+        if ($script:KeepWatching) {
+            Add-Important '⚠ 盯着模式下子进程提前退出了 —— 机制没生效，看上面的输出。'
+        }
         # 不看退出码（Start-Process -PassThru 拿不到），直接看脚本自己打印的结论 —— 反而更准。
         $t = $script:RedialAllText
         $verdict =
@@ -335,7 +338,7 @@ function Update-Redial {
         elseif ($t -like '*No good exit was found*') { '尝试次数用完，没找到好出口（失败）' }
         elseif ($t -like '*好了喵*') { '找到好出口并确认，完成' }
         else { '进程已退出 —— 结论看上面的输出' }
-        Add-LogLine ('重拨模式：结束 —— {0}' -f $verdict)
+        Add-Important ('重拨模式：结束 —— {0}' -f $verdict)
         $script:RedialDone = $true
     }
 }
@@ -355,6 +358,11 @@ function Append-NewOutput {
     $script:TailOffsets[$Tag] = $text.Length
     if ($Tag -eq '重拨') {
         $script:RedialAllText += $new
+        # 盯着模式可能连跑几小时：不设上限这个字符串会把内存吃掉。
+        # 只留最近 2MB —— "好了喵"这类标记是一出现就立刻处理的，削前面不影响判定。
+        if ($script:RedialAllText.Length -gt 2MB) {
+            $script:RedialAllText = $script:RedialAllText.Substring($script:RedialAllText.Length - 2MB)
+        }
         # 重拨脚本每换一个出口就会打一行 "Attempt N"（高速模式是"第 N 次连接尝试"）——
         # 把最大的那个数抓到，界面就能显示"已尝试 N 次"，没成功时它只会往上加。
         foreach ($m in [regex]::Matches($new, 'Attempt\s+(\d+)|第\s*(\d+)\s*次连接尝试')) {
@@ -426,7 +434,7 @@ $pageRedial.Controls.Add((New-UiLabel -Text '重新拨号，直到三轮探测�
 $grpMode = New-Object System.Windows.Forms.GroupBox
 $grpMode.Text = '运行方式'
 $grpMode.Location = New-Object System.Drawing.Point(12, 38)
-$grpMode.Size = New-Object System.Drawing.Size(470, 112)
+$grpMode.Size = New-Object System.Drawing.Size(470, 90)
 $grpMode.Font = $fontUi
 $pageRedial.Controls.Add($grpMode)
 
@@ -438,16 +446,9 @@ $script:RadioPlain.Font = $fontUi
 $script:RadioPlain.Checked = $true
 $grpMode.Controls.Add($script:RadioPlain)
 
-$script:RadioTestOnly = New-Object System.Windows.Forms.RadioButton
-$script:RadioTestOnly.Text = '只测当前出口：不拨号，只判断现在这条好不好'
-$script:RadioTestOnly.Location = New-Object System.Drawing.Point(12, 40)
-$script:RadioTestOnly.Size = New-Object System.Drawing.Size(440, 22)
-$script:RadioTestOnly.Font = $fontUi
-$grpMode.Controls.Add($script:RadioTestOnly)
-
 $script:RadioHighBandwidth = New-Object System.Windows.Forms.RadioButton
 $script:RadioHighBandwidth.Text = '高速模式：重拨到西电测速超过 150 Mbps'
-$script:RadioHighBandwidth.Location = New-Object System.Drawing.Point(12, 62)
+$script:RadioHighBandwidth.Location = New-Object System.Drawing.Point(12, 40)
 $script:RadioHighBandwidth.Size = New-Object System.Drawing.Size(440, 22)
 $script:RadioHighBandwidth.Font = $fontUi
 $grpMode.Controls.Add($script:RadioHighBandwidth)
@@ -457,7 +458,7 @@ $grpMode.Controls.Add($script:RadioHighBandwidth)
 # 而是隔一轮再探一次，探到坏的就自动重新拨号。
 $script:ChkWatch = New-Object System.Windows.Forms.CheckBox
 $script:ChkWatch.Text = '拿到好出口后继续盯着（不退出；坏了自动重新拨号）'
-$script:ChkWatch.Location = New-Object System.Drawing.Point(12, 86)
+$script:ChkWatch.Location = New-Object System.Drawing.Point(12, 64)
 $script:ChkWatch.Size = New-Object System.Drawing.Size(440, 22)
 $script:ChkWatch.Font = $fontUi
 $script:ChkWatch.Checked = $true
@@ -465,19 +466,19 @@ $grpMode.Controls.Add($script:ChkWatch)
 
 $btnRedialStart = New-Object System.Windows.Forms.Button
 $btnRedialStart.Text = '开始'
-$btnRedialStart.Location = New-Object System.Drawing.Point(12, 158)
+$btnRedialStart.Location = New-Object System.Drawing.Point(12, 136)
 $btnRedialStart.Size = New-Object System.Drawing.Size(96, 30)
 $pageRedial.Controls.Add($btnRedialStart)
 
 $btnRedialStop = New-Object System.Windows.Forms.Button
 $btnRedialStop.Text = '停止'
-$btnRedialStop.Location = New-Object System.Drawing.Point(116, 158)
+$btnRedialStop.Location = New-Object System.Drawing.Point(116, 136)
 $btnRedialStop.Size = New-Object System.Drawing.Size(96, 30)
 $btnRedialStop.Enabled = $false
 $pageRedial.Controls.Add($btnRedialStop)
 
 $lblRedialState = New-Object System.Windows.Forms.Label
-$lblRedialState.Location = New-Object System.Drawing.Point(224, 164)
+$lblRedialState.Location = New-Object System.Drawing.Point(224, 142)
 $lblRedialState.Size = New-Object System.Drawing.Size(258, 22)
 $lblRedialState.Font = $fontUi
 $lblRedialState.ForeColor = [System.Drawing.Color]::DimGray
@@ -485,7 +486,7 @@ $lblRedialState.Text = '未运行'
 $pageRedial.Controls.Add($lblRedialState)
 
 $lblRedialHint = New-Object System.Windows.Forms.Label
-$lblRedialHint.Location = New-Object System.Drawing.Point(12, 192)
+$lblRedialHint.Location = New-Object System.Drawing.Point(12, 170)
 $lblRedialHint.Size = New-Object System.Drawing.Size(470, 38)
 $lblRedialHint.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 8)
 $lblRedialHint.ForeColor = [System.Drawing.Color]::DimGray
@@ -525,12 +526,15 @@ $pageGame.Controls.Add($lblGameHint)
 
 $form.Controls.Add((New-UiLabel -Text '日志' -X 16 -Y 508 -W 200 -Bold $true))
 
-$txtOutput = New-Object System.Windows.Forms.TextBox
+$txtOutput = New-Object System.Windows.Forms.RichTextBox
 $txtOutput.Location = New-Object System.Drawing.Point(16, 530)
 $txtOutput.Size = New-Object System.Drawing.Size(508, 126)
-$txtOutput.Multiline = $true
+# 用 RichTextBox 才能逐段上色（普通 TextBox 整块只能一个颜色）。
+# WordWrap 关掉、双滚动条：探测表那种长行不折行，横向滚过去看（按计划定的）。
 $txtOutput.ReadOnly = $true
-$txtOutput.ScrollBars = 'Vertical'
+$txtOutput.WordWrap = $false
+$txtOutput.ScrollBars = 'Both'
+$txtOutput.DetectUrls = $false
 $txtOutput.Font = $fontMono
 $txtOutput.BackColor = [System.Drawing.Color]::White
 $form.Controls.Add($txtOutput)
@@ -542,7 +546,7 @@ $btnRestore.Size = New-Object System.Drawing.Size(121, 30)
 $form.Controls.Add($btnRestore)
 
 $btnBoth = New-Object System.Windows.Forms.Button
-$btnBoth.Text = '测一轮双出口'
+$btnBoth.Text = '测试出口'
 $btnBoth.Location = New-Object System.Drawing.Point(145, 664)
 $btnBoth.Size = New-Object System.Drawing.Size(121, 30)
 $form.Controls.Add($btnBoth)
@@ -562,9 +566,15 @@ $btnExit.Location = New-Object System.Drawing.Point(403, 664)
 $btnExit.Size = New-Object System.Drawing.Size(121, 30)
 $form.Controls.Add($btnExit)
 
+# 日志配色（按计划）：重点=橙，普通=黑。
+# 重点 = 模式开停与结果 / 「测试出口」的结果 / 失败与警告；
+# 普通 = 重拨探测表流、"正在…"这类过程、界面/托盘诊断。
+$script:LogOrange = [System.Drawing.Color]::DarkOrange
+
 function Add-LogLine {
-    param([string]$Text)
+    param([string]$Text, [System.Drawing.Color]$Color = [System.Drawing.Color]::Black)
     # **先落盘再写界面**：界面那半句万一抛（控件状态异常之类），日志不该跟着一起丢。
+    # 落盘是纯文本、不带颜色。
     try {
         $logFile = Join-Path $script:LogDir 'ui.log'
         # 注意别写成 `if (Test-Path X -and (Get-Item X).Length ...)`：
@@ -580,7 +590,32 @@ function Add-LogLine {
             [Text.UTF8Encoding]::new($false))
     }
     catch { }
-    try { $txtOutput.AppendText(('[{0}] {1}{2}' -f (Get-Date -Format 'HH:mm:ss'), $Text, [Environment]::NewLine)) } catch { }
+    try {
+        # RichTextBox 靠 SelectionColor 指定这段文字的颜色：
+        # 定位到末尾 → 设色 → 追加 → **复位回黑**（否则后面全跟着变色）→ 滚到末尾。
+        $txtOutput.SelectionStart = $txtOutput.TextLength
+        $txtOutput.SelectionLength = 0
+        $txtOutput.SelectionColor = $Color
+        $txtOutput.AppendText(('[{0}] {1}{2}' -f (Get-Date -Format 'HH:mm:ss'), $Text, [Environment]::NewLine))
+        $txtOutput.SelectionColor = [System.Drawing.Color]::Black
+        $txtOutput.ScrollToCaret()
+        # 上限：重拨"盯着"时日志会一直涨，从头削掉一段（只保最近的）
+        if ($txtOutput.TextLength -gt 120000) {
+            $txtOutput.SelectionStart = 0
+            $txtOutput.SelectionLength = 40000
+            $txtOutput.SelectedText = ''
+            $txtOutput.SelectionStart = $txtOutput.TextLength
+            $txtOutput.SelectionLength = 0
+        }
+    }
+    catch { }
+}
+
+function Add-Important {
+    # 重点行：和 Add-LogLine 同样写盘，只是标成橙色。
+    # 想改"什么算重点/什么颜色"只动这里，不用到处手写 -Color。
+    param([string]$Text)
+    Add-LogLine -Text $Text -Color $script:LogOrange
 }
 
 # ---------------------------------------------------------------- 刷新
@@ -702,7 +737,6 @@ function Update-UiStates {
         $btnRedialStart.Enabled = (-not $redialRunning) -and (-not $gameRunning)
         $btnRedialStop.Enabled = $redialRunning
         $script:RadioPlain.Enabled = -not $redialRunning
-        $script:RadioTestOnly.Enabled = -not $redialRunning
         $script:RadioHighBandwidth.Enabled = -not $redialRunning
 
         if ($redialRunning) {
@@ -711,9 +745,16 @@ function Update-UiStates {
             if ($script:RedialStartedAt) {
                 $elapsed = Format-Elapsed -Seconds ([int]((Get-Date) - $script:RedialStartedAt).TotalSeconds)
             }
-            $lblRedialState.Text = ('运行中 · 尝试 {0} 次 · {1}' -f $script:RedialAttempts, $elapsed)
+            # 启用了「继续盯着」就用「盯着中」代替「运行中」—— 字数一样，标签宽度不用改。
+            $head = if ($script:KeepWatching) { '盯着中' } else { '运行中' }
+            $lblRedialState.Text = ('{0} · 尝试 {1} 次 · {2}' -f $head, $script:RedialAttempts, $elapsed)
             $lblRedialState.ForeColor = [System.Drawing.Color]::DarkGreen
-            $lblRedialHint.Text = '正在跑，日志区会实时更新；要停就点「停止」。'
+            $lblRedialHint.Text = if ($script:KeepWatching) {
+                '盯着中：拿到好出口不退出，隔一轮再探一次，坏了自动重拨；要收工点「停止」。'
+            }
+            else {
+                '正在跑，日志区会实时更新；要停就点「停止」。'
+            }
         }
         elseif ($gameRunning) {
             $lblRedialState.Text = '被游戏模式占用'
@@ -763,6 +804,9 @@ function Update-UiStates {
             $lblGameHint.ForeColor = [System.Drawing.Color]::DimGray
         }
 
+        # ---- 测试出口：游戏模式会拿同一批 canary 做 /32 验证、重拨模式在不停换出口 ——
+        #      两边都会让这一轮数字不可信（错的可用性 / 错的网速），所以直接置灰，比事后警告可靠。
+        $btnBoth.Enabled = (-not $redialRunning) -and (-not $gameRunning)
         # ---- 拨号开关按钮：跑着模式时别去跟它们抢拨号
         $btnDial.Enabled = (-not $redialRunning) -and (-not $gameRunning)
         $btnDial.Text = if ($S -and $S.dialConnected) { '断开拨号' } else { '拨号' }
@@ -819,7 +863,7 @@ $btnRefresh.Add_Click({
     }
     Update-Status | Out-Null
     Update-AutoStartSwitch
-    Add-LogLine ('已重新检测。行为确认：' + $script:CarrierEvidence)
+    Add-Important ('已重新检测。行为确认：' + $script:CarrierEvidence)
 })
 
 $btnRedialStart.Add_Click({
@@ -830,7 +874,7 @@ $btnRedialStart.Add_Click({
                 '游戏模式正在跑。两个模式都会动拨号，同时跑会互相抢，所以只能开一个。',
                 '先关掉游戏模式', 'OK', 'Warning') | Out-Null
         }
-        'already' { Add-LogLine '重拨模式已经在跑了。' }
+        'already' { Add-Important '重拨模式已经在跑了。' }
     }
     Update-Status -Fresh | Out-Null
 })
@@ -844,16 +888,16 @@ $btnGameToggle.Add_Click({
     if (Test-ManagerRunning) {
         $r = Stop-GameMode
         if ($r -eq 'stopped') {
-            Add-LogLine '游戏模式已关闭（优雅退出：电话簿开关会还原成拨号优先）。'
+            Add-Important '游戏模式已关闭（优雅退出：电话簿开关会还原成拨号优先）。'
         }
         else {
-            Add-LogLine '停止超时：管理器还在跑。可以再点一次，或直接结束那个进程。'
+            Add-Important '停止超时：管理器还在跑。可以再点一次，或直接结束那个进程。'
         }
     }
     else {
         $r = Start-GameMode
         switch ($r) {
-            'started' { Add-LogLine '游戏模式已开启（管理器在后台运行；它会自己请求提权）。' }
+            'started' { Add-Important '游戏模式已开启（管理器在后台运行；它会自己请求提权）。' }
             'no-wifi' {
                 # 别咬定"热点没连" —— 可能是 Wi-Fi 网卡/路由有、只是这一次网关 ping 不通。
                 # 把当下的事实一起打出来，免得用户对着"请先连热点"发呆。
@@ -862,7 +906,7 @@ $btnGameToggle.Add_Click({
                     ('Wi-Fi「{0}」状态 {1}、IP {2}；网关探测没通过（每 8 秒会自动重查）' -f $d.wifiName, $d.wifiStatus, $d.wifiIp)
                 }
                 else { '读不到 Wi-Fi 状态' }
-                Add-LogLine ('开不了游戏模式：判定 Wi-Fi（热点）当前不可用 —— {0}' -f $detail)
+                Add-Important ('开不了游戏模式：判定 Wi-Fi（热点）当前不可用 —— {0}' -f $detail)
                 [System.Windows.Forms.MessageBox]::Show(
                     ('游戏模式需要 Wi-Fi（热点）可用。' + [Environment]::NewLine + [Environment]::NewLine +
                      '它靠"把拨号停放到 Wi-Fi 旁边、流量跑在 Wi-Fi 上、拨号只做后台候选"工作；' + [Environment]::NewLine +
@@ -882,29 +926,39 @@ $chkAutoStart.Add_CheckedChanged({
     $want = if ($chkAutoStart.Checked) { 'On' } else { 'Off' }
     $r = Invoke-Hidden -Target @($script:AutoStartPath, '-ManagerAutostart', $want) -TimeoutSeconds 120
     $msg = @($r.Output -split "`r?`n" | Where-Object { $_ } | Select-Object -Last 1)
-    Add-LogLine ('开机自启 -> {0}：{1}' -f $want, $(if ($msg.Count) { $msg[0].Trim() } else { '退出码 ' + $r.ExitCode }))
+    Add-Important ('开机自启 -> {0}：{1}' -f $want, $(if ($msg.Count) { $msg[0].Trim() } else { '退出码 ' + $r.ExitCode }))
     Update-AutoStartSwitch
 })
 
 $btnRestore.Add_Click({
     $r = Invoke-Hidden -Target @($script:EnginePath, '-RestoreDialPriority') -TimeoutSeconds 180
     $line = @($r.Output -split "`r?`n" | Where-Object { $_ -match '已|失败|目标' } | Select-Object -Last 1)
-    Add-LogLine ('恢复拨号优先：{0}' -f $(if ($line.Count) { $line[0].Trim() } else { '退出码 ' + $r.ExitCode }))
+    Add-Important ('恢复拨号优先：{0}' -f $(if ($line.Count) { $line[0].Trim() } else { '退出码 ' + $r.ExitCode }))
     Update-Status -Fresh | Out-Null
 })
 
 $btnBoth.Add_Click({
-    Add-LogLine '正在测两个出口（各一次探针 + 出口源地址确认）...'
+    Add-LogLine '正在测双出口（每出口：2 个探针 + 出口源地址确认 + 5 秒网速）…… 约 15-20 秒'
     [System.Windows.Forms.Application]::DoEvents()
     $r = Invoke-Hidden -Target @($script:BothExitsPath, '-Once', '-Json') -TimeoutSeconds 240
     try {
         $j = $r.Output | ConvertFrom-Json
-        Add-LogLine ('  拨号  {0}  {1}  通过 {2}/{3}  源={4}' -f $j.dial.ip, $(if ($j.dial.ok) { '可用' } else { '不可用' }), $j.dial.passed, $j.dial.total, $j.dial.egress)
-        Add-LogLine ('  Wi-Fi {0}  {1}  通过 {2}/{3}  源={4}' -f $j.wifi.ip, $(if ($j.wifi.ok) { '可用' } else { '不可用' }), $j.wifi.passed, $j.wifi.total, $j.wifi.egress)
-        Add-LogLine ('  => {0}' -f $j.verdict)
+        $dSpeed = if ($null -ne $j.dial.mbps) { ('{0:N2} Mbps' -f $j.dial.mbps) } elseif ($j.dial.speedNote) { $j.dial.speedNote } else { '—' }
+        $wSpeed = if ($null -ne $j.wifi.mbps) { ('{0:N2} Mbps' -f $j.wifi.mbps) } elseif ($j.wifi.speedNote) { $j.wifi.speedNote } else { '—' }
+        Add-Important ('  拨号  {0}  {1}  通过 {2}/{3}  测速 {4}  源={5}' -f $j.dial.ip, $(if ($j.dial.ok) { '可用' } else { '不可用' }), $j.dial.passed, $j.dial.total, $dSpeed, $j.dial.egress)
+        Add-Important ('  Wi-Fi {0}  {1}  通过 {2}/{3}  测速 {4}  源={5}' -f $j.wifi.ip, $(if ($j.wifi.ok) { '可用' } else { '不可用' }), $j.wifi.passed, $j.wifi.total, $wSpeed, $j.wifi.egress)
+        Add-Important ('  => {0}' -f $j.verdict)
     }
     catch {
-        Add-LogLine ('测一轮失败：拿不到 JSON（退出码 {0}）。原始输出：{1}' -f $r.ExitCode, ($r.Output -replace "`r?`n", ' '))
+        $extra = if ($r.Error) { ('  错误：{0}' -f (($r.Error -replace "`r?`n", ' '))) } else { '' }
+        Add-Important ('测一轮失败：拿不到 JSON（退出码 {0}）。{1}原始输出：{2}' -f $r.ExitCode, $extra, ($r.Output -replace "`r?`n", ' '))
+    }
+    # 子进程的 stderr 单独存在 $r.Error 里（不能并进 stdout，否则 JSON 解析会被警告污染）。
+    # 里面典型的是"网络管理器正在运行"那条 WARN —— 按橙色显示。
+    if ($r.Error) {
+        foreach ($eLine in ($r.Error -split "`r?`n")) {
+            if ($eLine.Trim()) { Add-Important ('  [警告] {0}' -f $eLine.Trim()) }
+        }
     }
     Update-Status -Fresh | Out-Null
 })
@@ -914,19 +968,19 @@ $btnDial.Add_Click({
     if ($st) { $script:LastStatus = $st }
     elseif ($script:LastStatus) { $st = $script:LastStatus }
     if (-not $st -or -not $st.dialName) {
-        Add-LogLine '拿不到拨号连接名，先点一下「重新检测」。'
+        Add-Important '拿不到拨号连接名，先点一下「重新检测」。'
         return
     }
 
     if (-not $st.dialConnected) {
         Add-LogLine ('拨号（{0}）现在是断开的，正在拨上…' -f $st.dialName)
         & rasdial.exe $st.dialName | Out-Null
-        Add-LogLine ('  结果：rasdial 退出码 {0}。连上后拨号重新成为默认网关（电话簿开关 = {1}）。' -f $LASTEXITCODE, $st.parkSwitch)
+        Add-Important ('  结果：rasdial 退出码 {0}。连上后拨号重新成为默认网关（电话簿开关 = {1}）。' -f $LASTEXITCODE, $st.parkSwitch)
     }
     else {
         Add-LogLine ('正在断开拨号（{0}）…' -f $st.dialName)
         & rasdial.exe $st.dialName /disconnect | Out-Null
-        Add-LogLine ('  结果：rasdial 退出码 {0}。流量现在走 Wi-Fi；电话簿开关不变（{1}），所以下次拨上来仍是拨号优先。' -f $LASTEXITCODE, $st.parkSwitch)
+        Add-Important ('  结果：rasdial 退出码 {0}。流量现在走 Wi-Fi；电话簿开关不变（{1}），所以下次拨上来仍是拨号优先。' -f $LASTEXITCODE, $st.parkSwitch)
     }
     Update-Status -Fresh | Out-Null
 })
@@ -1011,7 +1065,7 @@ $form.Add_Shown({
         Update-AutoStartSwitch
         Add-LogLine '界面已就绪。'
         if ($s -and -not $s.wifiAlive) {
-            Add-LogLine '提示：Wi-Fi（热点）当前不可用 —— 游戏模式暂时开不了，重拨模式和其它按钮照常可用。'
+            Add-Important '提示：Wi-Fi（热点）当前不可用 —— 游戏模式暂时开不了，重拨模式和其它按钮照常可用。'
         }
     }
     catch { Write-UiError -Where 'Add_Shown' -Err $_ }
