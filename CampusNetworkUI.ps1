@@ -37,8 +37,8 @@ Add-Type -AssemblyName System.Drawing
 
 # 给这个进程一个**自己的任务栏身份**。
 # 界面是跑在 powershell.exe 里的，默认会继承 PowerShell 的 AppUserModelID ——
-# 任务栏/托盘就会按 PowerShell 来归类（实测：系统里连一条属于本程序的托盘图标记录都没有），
-# 按钮图标也可能跟着用宿主的。设了自己的 ID 之后，Windows 按窗口自己的图标来画。
+# 任务栏就会按 PowerShell 来归类，按钮图标也可能跟着用宿主的（实测系统里连一条
+# 属于本程序的图标记录都没有）。设了自己的 ID 之后，Windows 按窗口自己的图标来画。
 # 必须在创建任何窗口之前调用。
 try {
     Add-Type -Namespace Win32 -Name AppId -MemberDefinition @'
@@ -559,7 +559,7 @@ $btnDial.Location = New-Object System.Drawing.Point(274, 664)
 $btnDial.Size = New-Object System.Drawing.Size(121, 30)
 $form.Controls.Add($btnDial)
 
-# 真正退出（和托盘右键那个「退出」一个动作：会先问要不要连模式一起停）
+# 真正退出（会先问要不要把正在跑的模式一起停掉）
 $btnExit = New-Object System.Windows.Forms.Button
 $btnExit.Text = '退出'
 $btnExit.Location = New-Object System.Drawing.Point(403, 664)
@@ -568,7 +568,7 @@ $form.Controls.Add($btnExit)
 
 # 日志配色（按计划）：重点=橙，普通=黑。
 # 重点 = 模式开停与结果 / 「测试出口」的结果 / 失败与警告；
-# 普通 = 重拨探测表流、"正在…"这类过程、界面/托盘诊断。
+# 普通 = 重拨探测表流、"正在…"这类过程、界面诊断。
 $script:LogOrange = [System.Drawing.Color]::DarkOrange
 
 function Add-LogLine {
@@ -810,6 +810,8 @@ function Update-UiStates {
         # ---- 拨号开关按钮：跑着模式时别去跟它们抢拨号
         $btnDial.Enabled = (-not $redialRunning) -and (-not $gameRunning)
         $btnDial.Text = if ($S -and $S.dialConnected) { '断开拨号' } else { '拨号' }
+        # ---- 标题栏 X：有模式在跑就不给关（系统菜单置灰；FormClosing 另外拦一道）
+        Update-CloseButton -AllowClose (-not ($gameRunning -or $redialRunning))
     }
     finally { $script:SuppressEvents = $false }
 }
@@ -985,16 +987,13 @@ $btnDial.Add_Click({
     Update-Status -Fresh | Out-Null
 })
 
-# ---------------------------------------------------------------- 图标 / 托盘 / 退出
+# ------------------------------------------- 图标 / 退出（关窗守卫）
 
-# 图标：exe 里内嵌了 app.ico，启动时解到脚本旁边，这里拿它当窗口图标和托盘图标。
+# 图标：exe 里内嵌了 app.ico，启动时解到脚本旁边，这里拿它当窗口图标。
 # 文件不在也不影响使用（退回系统默认图标）。
 $iconPath = Join-Path $script:Root 'app.ico'
-$script:TrayIcon = $null
 if (Test-Path -LiteralPath $iconPath) {
     try { $form.Icon = New-Object System.Drawing.Icon($iconPath) } catch { }
-    # 托盘只有 16×16 大小，单独取那一帧比缩放 32×32 清楚
-    try { $script:TrayIcon = New-Object System.Drawing.Icon($iconPath, 16, 16) } catch { }
 }
 
 function Exit-App {
@@ -1016,40 +1015,35 @@ function Exit-App {
     $script:ReallyExiting = $true
     try { Add-LogLine '正在退出。' } catch { }
     try { $timer.Stop() } catch { }
-    try { $tray.Visible = $false; $tray.Dispose() } catch { }
     $form.Close()
 }
 
-# 托盘：关窗口只是收起来，右键托盘才真退出
+# 真正退出的开关：Exit-App 置它让 FormClosing 放行（正常关窗的守卫见下面的 Update-CloseButton）
 $script:ReallyExiting = $false
-$script:BalloonShown = $false
 
-$tray = New-Object System.Windows.Forms.NotifyIcon
-$tray.Text = '校园网网络管理器'
-$tray.Icon = if ($script:TrayIcon) { $script:TrayIcon } elseif ($form.Icon) { $form.Icon } else { [System.Drawing.SystemIcons]::Application }
-$tray.Visible = $true
-
-$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
-$miOpen = $trayMenu.Items.Add('打开界面')
-[void]$trayMenu.Items.Add('-')
-$miExit = $trayMenu.Items.Add('退出')
-$tray.ContextMenuStrip = $trayMenu
-
-# 记一条日志：万一托盘里找不到图标，至少能从这里确认"图标确实创建了"。
-Add-LogLine ('托盘图标已创建（{0}）。Win11 默认把新托盘图标收进折叠区，记得拖出来钉住。任务栏身份 hr={1}' -f $(
-    if ($script:TrayIcon) { 'app.ico 的 16×16 帧' }
-    elseif ($form.Icon) { 'app.ico 的默认帧' }
-    else { '系统默认图标（没找到 app.ico）' }), $(if ($null -ne $script:AppIdResult) { ('0x{0:X}' -f $script:AppIdResult) } else { '未设置' }))
-
-$showWindow = {
-    $form.Show()
-    $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
-    [void]$form.Activate()
-}
-$miOpen.Add_Click($showWindow)
-$tray.Add_MouseDoubleClick($showWindow)
-$miExit.Add_Click({ Exit-App })
 $btnExit.Add_Click({ Exit-App })
+
+# --- 标题栏 X 的守卫 --------------------------------------------------------
+# WinForms 没法只把标题栏那个 X 变灰（它是系统画的非客户区按钮），所以两层配合：
+#   1) 系统菜单里的「关闭」置灰/启用 —— Alt+Space→关闭 会灰掉、点不动；
+#   2) FormClosing 里拦下关闭并弹提示 —— 这层是真正保证行为的，即使第 1 层没生效。
+# 有任一模式在跑就禁用；没活动才允许正常关窗。
+Add-Type -Namespace Win32 -Name Frame -MemberDefinition @'
+[DllImport("user32.dll")] public static extern IntPtr GetSystemMenu(IntPtr hWnd, bool bRevert);
+[DllImport("user32.dll")] public static extern bool EnableMenuItem(IntPtr hMenu, uint uIDEnableItem, uint uEnable);
+public static void SetCloseEnabled(IntPtr hwnd, bool enabled) {
+    IntPtr menu = GetSystemMenu(hwnd, false);
+    if (menu == IntPtr.Zero) return;
+    // MF_BYCOMMAND=0；MF_GRAYED(0x1)|MF_DISABLED(0x2)=0x3；SC_CLOSE=0xF060
+    EnableMenuItem(menu, 0xF060, enabled ? 0u : 0x3u);
+}
+'@
+
+function Update-CloseButton {
+    param([bool]$AllowClose)
+    if (-not $form.IsHandleCreated) { return }
+    try { [Win32.Frame]::SetCloseEnabled($form.Handle, $AllowClose) } catch { }
+}
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1000
@@ -1073,18 +1067,29 @@ $form.Add_Shown({
 
 $form.Add_FormClosing({
     param($sender, $e)
+    # 「退出」按钮走的是 ReallyExiting：它会先尽量把模式停掉再要求关闭 —— 这里放行。
     if ($script:ReallyExiting) {
         $timer.Stop()
         return
     }
-    # 点 X ≠ 退出：收进托盘（管理器继续跑）。要真退出走托盘右键或界面上的「退出」。
-    $e.Cancel = $true
-    $form.Hide()
-    Add-LogLine '窗口已收进托盘（程序还在跑）；退出：右键托盘图标 →「退出」，或界面上的「退出」按钮。'
-    if (-not $script:BalloonShown) {
-        $script:BalloonShown = $true
-        try { $tray.ShowBalloonTip(3000, '还在后台运行', '关掉窗口只是收起界面。退出：右键任务栏托盘图标 → 退出。', 'Info') } catch { }
+    # 有任一模式在跑：不给关。托盘已经去掉了，关掉就没人知道模式还活着。
+    # 标题栏那个 X 没法只把它变灰（非客户区是系统画的），所以：
+    #   1) 这里直接拦下关闭并弹提示（真正保证行为的一层）；
+    #   2) Update-CloseButton 把系统菜单里的「关闭」置灰（Alt+Space→关闭 同样点不动）。
+    $gameRunning = Test-ManagerRunning
+    $redialRunning = [bool]($script:RedialProc -and -not $script:RedialProc.HasExited)
+    if ($gameRunning -or $redialRunning) {
+        $e.Cancel = $true
+        $names = @()
+        if ($gameRunning) { $names += '游戏模式' }
+        if ($redialRunning) { $names += '重拨模式' }
+        [System.Windows.Forms.MessageBox]::Show(
+            ('还有 {0} 在跑，窗口关不掉。先关掉它，或者点最下面的「退出」（会问你要不要一起停掉）。' -f ($names -join ' 和 ')),
+            '先别关', 'OK', 'Information') | Out-Null
+        return
     }
+    # 没有活动：正常关闭
+    $timer.Stop()
 })
 
 [void]$form.ShowDialog()
